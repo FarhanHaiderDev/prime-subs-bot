@@ -10,6 +10,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 import requests
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -1046,6 +1047,21 @@ async def hold_order(bot: Bot, order: dict, reason: str) -> None:
         logging.exception("Could not notify user %s", order["user_id"])
 
 
+async def start_health_server() -> web.AppRunner:
+    """Tiny HTTP server so hosts like Render see an open port and a healthy service."""
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="Bot is running", status=200)
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info("Health server listening on port %s", port)
+    return runner
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN:
@@ -1059,7 +1075,11 @@ async def main():
     load_prefs()
     bot = Bot(token=BOT_TOKEN)
     await bot.set_my_commands(BOT_COMMANDS)
-    await dp.start_polling(bot)
+    runner = await start_health_server()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
