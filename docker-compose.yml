@@ -1,6 +1,23 @@
-# Services for local development and tests. The production bot service is added with the
-# Dockerfile (see DEPLOY.md).
 services:
+  # The bot. Configuration comes from .env (copy .env.example and fill it in; never commit it).
+  #   docker compose up -d --build bot
+  # Run exactly ONE instance: two bots polling the same token conflict, and two instances
+  # could race on an order. MongoDB is external (Atlas); see DEPLOY.md.
+  bot:
+    build: .
+    image: prime-subs-bot:latest
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080" # health endpoint, localhost only; put a reverse proxy in front if it must be public
+    read_only: true # the bot writes no files
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   # Throwaway MongoDB for the real-database tests. It exists only under the "test" profile:
   #   docker compose --profile test up -d mongo-test
   #   MONGODB_TEST_URI=mongodb://127.0.0.1:27018 pytest

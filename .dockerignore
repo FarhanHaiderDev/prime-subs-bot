@@ -1,0 +1,24 @@
+# Never send secrets or local state into the image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Not needed at run time.
+.git
+.github
+.vscode
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+scripts
+backups
+requirements-dev.txt
+pytest.ini
+docker-compose.yml
+Dockerfile
+*.md
+AUDIT_REPORT.md
