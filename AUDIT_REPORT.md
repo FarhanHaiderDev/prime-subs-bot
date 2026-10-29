@@ -23,9 +23,30 @@ The sections below describe the tree **as audited** (commit `00371eb`); the file
 
 **New or changed environment variables (names only):** `ENCRYPTION_KEY` (required), `CANBOSO_ENABLED` (optional, keep `false`), and `MONGODB_URI` is required as before. **New order statuses/fields:** status `purchased_undelivered`; fields `credentials_enc`, `purchased_at`, `delivered_at`, `delivery_attempts`, `pay_to`.
 
-**Resolution of the 27 problems in section 9:** 2 resolved (#1, #5), 7 partially resolved (#2, #4, #6, #7, #9, #22, #23), 1 mitigated but still open (#3), 17 open. Each item in section 9 below carries its status tag.
+**Resolution of the 27 problems in section 9 after Phase 0/1:** 2 resolved (#1, #5), 7 partially resolved (#2, #4, #6, #7, #9, #22, #23), 1 mitigated but still open (#3), 17 open. See the Phase 3 section for the current totals.
 
-**Known limits of this verification:** the new `ENCRYPTION_KEY`/`MONGODB_URI` values must be added to your real `.env` by you; the in-memory MongoDB used by the tests does not implement aggregation-pipeline updates, so startup recovery (`recover_interrupted_orders`) is not covered by the tests; Pandora and Canboso behaviour is still unverified against the real APIs.
+**Known limits of this verification:** the new `ENCRYPTION_KEY`/`MONGODB_URI` values must be added to your real `.env` by you; Pandora and Canboso behaviour is still unverified against the real APIs. (An earlier version of this note said the in-memory MongoDB cannot run the startup-recovery pipeline update. That was wrong: it can, and Phase 3 Item 1 tests recovery on it and on a real server.)
+
+---
+
+## PHASE 3 STATUS UPDATE (branch `fix/phase3`, built on `fix/phase1`)
+
+Eight items, one commit each, with tests (161 pass, 13 skipped, run offline). The 13 skipped are the real-MongoDB runs of the recovery tests: they need `MONGODB_TEST_URI`, which was not available here (no Docker, no `mongod`), so **those runs have not been executed yet**. CI runs them against a real MongoDB service and fails if it cannot.
+
+| Item | Change |
+|---|---|
+| 1 | `tests/test_recovery.py`: startup recovery in every order state (fulfilling, fulfilling+purchased, fulfilling after an unlocked retry; pending/held/reconcile/delivered/rejected/delivery_failed/purchased_undelivered untouched), idempotency, what a recovered order may do next, the restart sequence for `purchased_undelivered`, a concurrent-claim race and the unique-proof index. Every test runs on the in-memory database and, when `MONGODB_TEST_URI` is set, on a real one (random database, dropped afterwards; Atlas refused unless allowed). `docker-compose.yml` has a throwaway `mongo-test` service. |
+| 2 | `@dp.errors()` handler: full traceback in the logs, a neutral reply to the user, a short throttled admin alert (exception type and update kind only). |
+| 3 | `ratelimit.py`: 8 messages / 10 s and 15 button presses / 10 s per user, and 5 payment-proof attempts / 10 min (checked before any database work); admin exempt. |
+| 4 | `logsetup.py`: JSON-lines logs with `order_id` on every line of an order flow, and secret redaction (exact environment values plus token/key/URI patterns) on message and traceback. A test greps the output of failure and success flows for secrets, credentials and payment proofs. |
+| 5 | `scripts/seller_contract_check.py`: read-only Pandora check (GET endpoints and error probes; `POST /quotes` only with `--with-quote`; never an order), prints shapes/status/error codes with the key masked. `--dry-run` sends nothing. |
+| 6 | `Dockerfile` (non-root uid 10001), `docker-compose.yml` (read-only, no capabilities, localhost health port), `.dockerignore`, `DEPLOY.md` with every environment variable name. |
+| 7 | `scripts/backup_mongo.sh` (timestamped, compressed, owner-only, URI never on the command line) and a backup/restore section in `DEPLOY.md`, stating that `ENCRYPTION_KEY` is not in the backup and must be stored separately. |
+| 8 | `.github/workflows/ci.yml`: tests against a real MongoDB service plus `scripts/secret_scan.py --history` on every push and pull request. |
+
+**Resolution of the 27 problems in section 9 (current):** 7 resolved (#1, #5, #7, #12, #14, #22, #23), 6 partially resolved (#2, #4, #6, #9, #13, #18), 1 mitigated but still open (#3), 13 open (#8, #10, #11, #15, #16, #17, #19, #20, #21, #24, #25, #26, #27). Each item in section 9 carries its tag.
+
+**Not verified in this session:** the Docker image was not built and `docker compose` was not run (no Docker here); the GitHub Actions workflow has not run (it is checked only for structure and YAML validity); `scripts/backup_mongo.sh` was tested against a stub `mongodump`, not the real tool; the contract check was only dry-run and tested with a fake session, never against the live Pandora API.
 
 ---
 
@@ -206,25 +227,25 @@ The sections below describe the tree **as audited** (commit `00371eb`); the file
 6. **[PARTIALLY RESOLVED (Fix 2 stops stale writes; a duplicate purchase through overlap/unlock still depends on the admin's Pandora confirmation)]** Overlapping instances / unlock-and-Retry can cause a second purchase: startup recovery flips every `fulfilling` order (storage.py:356-388), the fence only blocks *new* requests, and unlock relies on the admin's Pandora confirmation (1445-1567; storage.py:324-354). Safety depends on that human confirmation.
 
 **MEDIUM**
-7. **[PARTIALLY RESOLVED (Fix 3: credentials encrypted at rest; backups still NOT PRESENT)]** No backup/restore mechanism in the repo; orders and plaintext credentials (1225-1231) live only in MongoDB.
+7. **[RESOLVED in the repo (Fix 3 encrypts credentials at rest; Phase 3 Item 7 adds scripts/backup_mongo.sh and restore docs). Running it on a schedule, copying backups off-site and backing up ENCRYPTION_KEY separately is up to the operator]** No backup/restore mechanism in the repo; orders and plaintext credentials (1225-1231) live only in MongoDB.
 8. **[OPEN]** Startup-recovery, hold and reconcile alerts are sent once and not retried if Telegram fails (1370-1378, 1382-1415, 1706-1722); recovered orders' customers are not notified.
 9. **[PARTIALLY RESOLVED (Fix 3: a paid-but-undelivered order shows Processing and is redelivered automatically; refunds/compensation still NOT PRESENT)]** No refund/compensation path for held, rejected or failed orders (NOT PRESENT); `delivery_failed` shows the paying customer "Failed" (671, 713).
 10. **[OPEN]** Stock race: no reservation; the last unit can be sold twice and the second order is held after payment (204-207, 976, 1003).
 11. **[OPEN]** Price drift between payment and approval makes the cost-ceiling check fail and the order hold (303, 381); there is no repricing.
-12. **[OPEN]** No rate limiting; each tap can trigger supplier catalog fetches (254-261, 976, 1003) and database reads.
-13. **[OPEN]** Seller behaviour is unverified: Pandora idempotency and error-code classification (342) rely on documentation not in the repo; Canboso response shapes are guessed (137-174).
-14. **[OPEN]** No global error handler; some user-facing failures are silent (e.g. a `TypeError` from a bad supplier payload escapes `build_catalog`, 234).
+12. **[RESOLVED (Phase 3 Item 3: per-user limits on messages, button presses and payment-proof attempts; admin exempt)]** No rate limiting; each tap can trigger supplier catalog fetches (254-261, 976, 1003) and database reads.
+13. **[PARTIALLY RESOLVED (Phase 3 Item 5: scripts/seller_contract_check.py can verify Pandora's shapes and error codes read-only; it has NOT been run against the live API, and Canboso is still unverified)]** Seller behaviour is unverified: Pandora idempotency and error-code classification (342) rely on documentation not in the repo; Canboso response shapes are guessed (137-174).
+14. **[RESOLVED (Phase 3 Item 2: global error handler with traceback logging, a neutral user reply and a short throttled admin alert)]** No global error handler; some user-facing failures are silent (e.g. a `TypeError` from a bad supplier payload escapes `build_catalog`, 234).
 
 **LOW**
 15. **[OPEN]** Duplicate new-order alert possible while the first alert is still in flight (1076 vs 1097; 1614-1643).
 16. **[OPEN (message is clearer; behaviour unchanged)]** A rejected order's reference stays blocked forever (storage.py:424).
 17. **[OPEN]** `Retry-After` parsed with `int()` raises on an HTTP-date header (332) - fails safe to `unknown`.
-18. **[OPEN]** Language-save failure logs a full traceback (800).
+18. **[PARTIALLY RESOLVED (Phase 3 Item 4: the traceback is still logged, but every log line is now redacted for secrets)]** Language-save failure logs a full traceback (800).
 19. **[OPEN]** Translations cover only the dashboard (576-617).
 20. **[OPEN]** FSM state lost on restart (78).
 21. **[OPEN]** Missing indexes for status-based scans (storage.py:356, 390); startup reference audit scans every order (storage.py:152-183).
-22. **[PARTIALLY RESOLVED (every dependency is exact-pinned; the Python version is still unpinned)]** No Python version pin; `pymongo` has no exact pin (`requirements.txt`).
-23. **[PARTIALLY RESOLVED (47 offline tests + pytest config added; Dockerfile/Procfile/CI still absent; health server unchanged)]** Deployment files, CI and tests absent; health server is unauthenticated on `0.0.0.0` (1646-1660).
+22. **[RESOLVED (every dependency is exact-pinned; the Dockerfile and CI pin Python 3.12)]** No Python version pin; `pymongo` has no exact pin (`requirements.txt`).
+23. **[RESOLVED (47+ offline tests, Dockerfile, docker-compose.yml, DEPLOY.md and a GitHub Actions workflow with tests and a secret scan; the image and the workflow have not been run here)]** Deployment files, CI and tests absent; health server is unauthenticated on `0.0.0.0` (1646-1660).
 24. **[OPEN]** `Bot` session is not closed on `SystemExit` paths (1685-1705) - cosmetic.
 25. **[OPEN (.vscode still tracked; stale JSON lines remain in .gitignore)]** `.vscode/settings.json` is tracked; `.gitignore` still lists `orders.json` / `prefs.json`.
 26. **[OPEN]** Admin id must be a user id, not a group id (552-553).
