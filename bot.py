@@ -31,6 +31,7 @@ from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
 from fsmstorage import MongoFSMStorage
 from logsetup import configure_logging, order_context, set_order_id
 from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
+from textutil import split_utf16, truncate_utf16
 from storage import (
     ORDER_RESERVATION_TTL_SECONDS,
     RESERVATION_TTL_SECONDS,
@@ -583,7 +584,8 @@ def unsaved_note(result: str) -> str:
     )
 
 
-TELEGRAM_CHUNK = 4000  # Telegram caps a message at 4096 characters
+TELEGRAM_MAX_UNITS = 4096  # Telegram's message limit, counted in UTF-16 code units
+TELEGRAM_CHUNK = 4000  # alert parts stay a little below it
 
 
 async def _send_admin_part(bot: Bot, text: str, reply_markup, protect_content: bool, attempts: int, order_id) -> bool:
@@ -630,7 +632,7 @@ async def alert_admin(
     if not ADMIN_CHAT_ID:
         logging.error("ADMIN_CHAT_ID not set; admin alert not sent (order %s)", order_id or "-")
         return False
-    chunks = [text[i:i + TELEGRAM_CHUNK] for i in range(0, len(text), TELEGRAM_CHUNK)] or [text]
+    chunks = split_utf16(text, TELEGRAM_CHUNK) or [text]
     for index, chunk in enumerate(chunks):
         markup = reply_markup if index == len(chunks) - 1 else None
         if not await _send_admin_part(bot, chunk, markup, protect_content, attempts, order_id):
@@ -876,7 +878,7 @@ async def render_orders(user_id: int) -> str:
             elif order.get("credentials_enc"):
                 block += "\nYour details could not be displayed right now. Please contact support."
         blocks.append(block)
-    return ("Your recent orders:\n\n" + "\n\n".join(blocks))[:4096]
+    return truncate_utf16("Your recent orders:\n\n" + "\n\n".join(blocks), TELEGRAM_MAX_UNITS)
 
 
 @dp.message(Command("orders"))
@@ -1045,7 +1047,7 @@ async def show_product(callback: CallbackQuery):
 
     lines = [listing.name, f"Price: {retail_price(listing.cost):.2f} USDT"]
     if listing.description:
-        lines.append(listing.description[:3000])  # Telegram caps messages at 4096 chars.
+        lines.append(truncate_utf16(listing.description, 3000))  # the whole message must stay under 4096 UTF-16 units
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="💳 Buy Now", callback_data=f"buy:{key}"))
@@ -2153,7 +2155,7 @@ MAX_AUTO_DELIVERY_ATTEMPTS = 5
 
 async def deliver_credentials(bot: Bot, order: dict, credentials: list[str]) -> bool:
     """Send the purchased credentials to the customer. True only if Telegram accepted it."""
-    text = (f"🎉 Your order: {order['name']}\n\n" + "\n".join(credentials))[:4096]
+    text = truncate_utf16(f"🎉 Your order: {order['name']}\n\n" + "\n".join(credentials), TELEGRAM_MAX_UNITS)
     try:
         await bot.send_message(order["user_id"], text)
         return True
@@ -2383,6 +2385,7 @@ async def main():
         # Log the exception type only; driver messages can echo connection details.
         raise SystemExit(f"Could not initialize MongoDB ({type(exc).__name__}).")
 
+    bot = None
     try:
         bot = Bot(token=BOT_TOKEN)
 
@@ -2422,7 +2425,13 @@ async def main():
             await asyncio.gather(retry_task, return_exceptions=True)
             await runner.cleanup()
     finally:
-        await storage.close()
+        try:
+            if bot is not None:
+                # Every way out (SystemExit included) must release the HTTP session; polling's own
+                # cleanup is never reached when startup stops early. Closing twice is harmless.
+                await bot.session.close()
+        finally:
+            await storage.close()
 
 
 if __name__ == "__main__":
