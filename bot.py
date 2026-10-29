@@ -29,7 +29,14 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
 from logsetup import configure_logging, order_context, set_order_id
 from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
-from storage import Storage, outbox_fields
+from storage import (
+    ORDER_RESERVATION_TTL_SECONDS,
+    RESERVATION_TTL_SECONDS,
+    RESERVE_MAX_TRACKED_STOCK,
+    Storage,
+    outbox_fields,
+    reservation_key,
+)
 
 load_dotenv()
 
@@ -144,6 +151,7 @@ class Offer:
     product_id: str
     variant_id: str | None
     cost: float
+    stock: int | None = None  # None = unknown
 
 
 @dataclass
@@ -237,7 +245,7 @@ def fetch_pandora() -> list[dict]:
             items.append({
                 "name": name,
                 "description": str(p.get("description") or ""),
-                "offer": Offer("pandora", p["id"], p.get("variant_id"), cost),
+                "offer": Offer("pandora", p["id"], p.get("variant_id"), cost, stock),
             })
         cursor = data.get("next_cursor")
         if not cursor:
@@ -1108,6 +1116,16 @@ async def choose_payment(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("That product is no longer available.")
         return
 
+    try:
+        reserved = await reserve_for_checkout(callback.from_user.id, listing.offers[0])
+    except PyMongoError as exc:
+        log_db_error("reserving stock", exc, user=callback.from_user.id)
+        await callback.message.answer(CHECKOUT_RETRY_LATER)
+        return
+    if reserved == "gone":
+        await callback.message.answer(STOCK_GONE_MESSAGE)
+        return
+
     price = retail_price(listing.cost)
     await state.set_state(Checkout.waiting_reference)
     await state.update_data(
@@ -1115,6 +1133,7 @@ async def choose_payment(callback: CallbackQuery, state: FSMContext):
         price=price,
         method=method_key,
         offers=[asdict(o) for o in listing.offers],
+        **(reserved or {}),
     )
 
     builder = InlineKeyboardBuilder()
@@ -1124,13 +1143,84 @@ async def choose_payment(callback: CallbackQuery, state: FSMContext):
         f"Amount: {price:.2f} USDT\n"
         f"Method: {method['label']}\n\n"
         f"Send exactly this amount to the {method['dest_label']}:\n{method['destination']}\n\n"
-        f"After paying, reply here with the {method['ref_label']}.",
+        f"After paying, reply here with the {method['ref_label']}."
+        + (
+            f"\n\nThis item is reserved for you for {RESERVATION_TTL_SECONDS // 60} minutes."
+            if reserved
+            else ""
+        ),
         reply_markup=builder.as_markup(),
     )
 
 
+STOCK_GONE_MESSAGE = (
+    "Sorry, this item has just run out of stock or is being held for other buyers right now. "
+    "Please check again in a few minutes."
+)
+CHECKOUT_RETRY_LATER = "Sorry, we couldn't start your order right now. Please try again in a moment."
+
+
+async def reserve_for_checkout(user_id: int, offer: Offer):
+    """Hold a unit for the buyer while they pay.
+
+    Returns None when the stock is unknown or plentiful (nothing to reserve), "gone" when no
+    unit is available, or the reservation details to keep in the checkout state."""
+    stock = offer.stock
+    if stock is None or stock > RESERVE_MAX_TRACKED_STOCK:
+        return None
+    key = reservation_key(offer.supplier, offer.product_id, offer.variant_id)
+    token = await storage.reserve_stock(key, user_id, stock, RESERVATION_TTL_SECONDS)
+    if token is None:
+        return "gone"
+    return {"reservation_token": token, "reservation_key": key, "reservation_stock": stock}
+
+
+async def release_checkout_reservation(state) -> None:
+    """The buyer cancelled: give the unit back right away instead of waiting for the TTL."""
+    token = (await state.get_data()).get("reservation_token")
+    if not token:
+        return
+    try:
+        await storage.release_reservation(token=token)
+    except PyMongoError as exc:
+        log_db_error("releasing a stock reservation", exc)
+
+
+async def release_order_stock(order_id: str) -> None:
+    """The order was rejected, failed or its purchase is done: free its reserved unit."""
+    try:
+        await storage.release_reservation(order_id=order_id)
+    except PyMongoError as exc:
+        log_db_error("releasing a stock reservation", exc, order=order_id)
+
+
+async def attach_order_reservation(order_id: str, user_id: int, data: dict) -> str:
+    """Tie the buyer's reservation to the order just created from their payment proof.
+
+    The buyer has already paid, so the order is created whatever happens here: if the
+    reservation expired and the unit was given away, one more attempt is made to hold a
+    unit, and otherwise the order is flagged "lapsed" so the admin knows the purchase may
+    fail. Returns "held", "lapsed", "untracked" or "unknown" (database error)."""
+    token = data.get("reservation_token")
+    if not token:
+        return "untracked"
+    try:
+        if await storage.attach_reservation(token, order_id, ORDER_RESERVATION_TTL_SECONDS):
+            return "held"
+        new_token = await storage.reserve_stock(
+            data["reservation_key"], user_id, data["reservation_stock"], ORDER_RESERVATION_TTL_SECONDS
+        )
+        if new_token and await storage.attach_reservation(new_token, order_id, ORDER_RESERVATION_TTL_SECONDS):
+            return "held"
+        return "lapsed"
+    except (PyMongoError, KeyError) as exc:
+        logging.error("Order %s: could not attach the stock reservation (%s)", order_id, type(exc).__name__)
+        return "unknown"
+
+
 @dp.callback_query(F.data == "cancel_order")
 async def cancel_order(callback: CallbackQuery, state: FSMContext):
+    await release_checkout_reservation(state)
     await state.clear()
     await callback.answer("Order cancelled")
     await send_menu(callback.message, callback.from_user.id)
@@ -1138,6 +1228,7 @@ async def cancel_order(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    await release_checkout_reservation(state)
     await state.clear()
     await send_menu(message, message.from_user.id)
 
@@ -1201,6 +1292,15 @@ async def receive_reference(message: Message, state: FSMContext):
         await message.answer(RETRY_LATER)
         return
 
+    order["stock_reservation"] = await attach_order_reservation(order_id, user.id, data)
+    if order["stock_reservation"] != "untracked":
+        try:
+            await storage.update_order(
+                order_id, {"stock_reservation": order["stock_reservation"]}, only_if_status="pending"
+            )
+        except PyMongoError as exc:
+            log_db_error("recording the stock reservation", exc, order=order_id)
+
     await state.clear()
 
     await message.answer(
@@ -1247,6 +1347,7 @@ async def reject_order(callback: CallbackQuery):
         await callback.answer("This order can't be rejected now.", show_alert=True)
         return
 
+    await release_order_stock(order_id)
     await callback.answer("Rejected")
     try:
         await callback.message.edit_text(f"{callback.message.text}\n\n❌ Rejected")
@@ -1353,6 +1454,7 @@ async def approve_order(callback: CallbackQuery):
             # Something else moved the order mid-purchase (e.g. a restart recovered it to
             # reconcile). Complete it only from reconcile; never overwrite a newer status.
             result = await persist_order(order_id, purchased_fields, "reconcile", claim_token)
+        await release_order_stock(order_id)  # the unit is bought: the supplier's stock now reflects it
         saved = result == SAVED
         stale = result == STALE
         marked = False
@@ -1503,6 +1605,7 @@ async def hold_order(bot: Bot, order: dict, reason: str, *, attempt: int | None 
     result = await persist_order(order["id"], fields, "fulfilling", order["claim_token"])
     logging.error("Order %s held: %s", order["id"], reason)
     if result == SAVED:
+        await release_order_stock(order["id"])
         await flush_one(bot, order["id"])
         return
     await alert_admin(
@@ -1529,6 +1632,7 @@ async def reconcile_order(bot: Bot, order: dict, reason: str) -> None:
     )
     logging.error("Order %s needs manual reconciliation: %s", order["id"], reason)
     if result == SAVED:
+        await release_order_stock(order["id"])
         await flush_one(bot, order["id"])
         return
     await alert_admin(
@@ -1828,6 +1932,15 @@ async def unlock_cancel(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(text)
 
 
+STOCK_NOTES = {
+    "held": "\nStock: a unit is reserved for this order.",
+    "lapsed": (
+        "\n⚠️ Stock: the reservation expired before the proof arrived and the unit may have gone, "
+        "so the purchase can fail."
+    ),
+}
+
+
 def new_order_alert(order: dict, delayed: bool = False) -> str:
     """The new-order alert the admin approves from. It states what payment to expect
     (amount, coin/network, destination) next to the proof the customer submitted, so the
@@ -1853,6 +1966,7 @@ def new_order_alert(order: dict, delayed: bool = False) -> str:
         f"Check that exactly {order['price']:.2f} {coin} arrived on {network} at the address above, "
         "and that this proof is that payment, before you tap Approve.\n"
         f"Source: {best['supplier']} at cost {best['cost']:.2f}{fallback}"
+        + STOCK_NOTES.get(order.get("stock_reservation"), "")
     )
 
 

@@ -128,6 +128,27 @@ class FakeBot:
         return [text for cid, text, _ in self.sent if str(cid) == str(chat_id)]
 
 
+class FakeState:
+    """A minimal stand-in for aiogram's FSMContext."""
+
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+        self.state = None
+        self.cleared = False
+
+    async def get_data(self):
+        return dict(self.data)
+
+    async def update_data(self, **kwargs):
+        self.data.update(kwargs)
+
+    async def set_state(self, state):
+        self.state = state
+
+    async def clear(self):
+        self.data, self.state, self.cleared = {}, None, True
+
+
 def make_callback(data, user_id=ADMIN_ID, message_text="alert text", fake_bot=None):
     message = SimpleNamespace(
         text=message_text, edit_text=AsyncMock(), answer=AsyncMock(), delete=AsyncMock()

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 SERVER_SELECTION_TIMEOUT_MS = 10_000
 DEFAULT_DB = "prime_subs_bot"
@@ -45,6 +46,13 @@ ALERT_BACKOFF_BASE_SECONDS = 60
 ALERT_BACKOFF_MAX_SECONDS = 3600
 MAX_NOTICE_ATTEMPTS = 8  # a customer who blocked the bot is given up on; the admin alert never is
 
+# Stock reservations: a scarce unit is held for a buyer while they pay. Each unit of a
+# product is a "slot" document whose _id is "<product key>#<n>"; claiming a slot is an atomic
+# insert (or an atomic takeover of an expired slot), so two buyers can never share one unit.
+RESERVATION_TTL_SECONDS = 15 * 60  # while the buyer pays
+ORDER_RESERVATION_TTL_SECONDS = 24 * 3600  # once their proof is in, until the admin decides
+RESERVE_MAX_TRACKED_STOCK = 50  # plentiful stock is not worth reserving
+
 REFERENCE_INDEX = "reference_lower_unique"
 USER_ORDERS_INDEX = "user_id_created_at"
 
@@ -67,6 +75,10 @@ def outbox_fields(kind: str) -> dict:
         "notice_attempts": 0,
         "notice_next_at": None,
     }
+
+
+def reservation_key(supplier: str, product_id: str, variant_id: str | None) -> str:
+    return f"{supplier}:{product_id}:{variant_id or '-'}"
 
 
 def resolve_lang(value: object) -> str:
@@ -233,6 +245,10 @@ class Storage:
             [("user_id", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
             name=USER_ORDERS_INDEX,
         )
+        reservations = self._db["reservations"]
+        await reservations.create_index("expires_at", expireAfterSeconds=0, name="reservation_ttl")
+        await reservations.create_index("token", name="reservation_token")
+        await reservations.create_index("order_id", name="reservation_order")
         # Small sparse indexes: only orders that owe an alert/notice are in them.
         await self._orders.create_index(
             [("alert_pending", ASCENDING), ("alert_next_at", ASCENDING)], name="alert_outbox", sparse=True
@@ -574,6 +590,69 @@ class Storage:
             next_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds(attempts))
             await self._orders.update_one({"_id": order_id}, {"$set": {"notice_next_at": next_at}})
         return attempts
+
+    # ---- Stock reservations ---------------------------------------------------------
+
+    async def reserve_stock(
+        self, key: str, user_id: int, stock: int, ttl_seconds: int = RESERVATION_TTL_SECONDS
+    ) -> str | None:
+        """Hold one unit of `key` (a product with `stock` units) for this buyer.
+
+        Returns a token, or None if every unit is held by someone else. A buyer who already
+        holds an unattached reservation for the product gets the same one back (refreshed),
+        so clicking twice never takes two units."""
+        if stock <= 0:
+            return None
+        coll = self._db["reservations"]
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=ttl_seconds)
+        mine = await coll.find_one_and_update(
+            {"key": key, "user_id": user_id, "order_id": None, "expires_at": {"$gt": now}},
+            {"$set": {"expires_at": expires}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if mine:
+            return mine["token"]
+        token = uuid.uuid4().hex
+        fields = {
+            "key": key, "user_id": user_id, "token": token, "order_id": None,
+            "created_at": now, "expires_at": expires,
+        }
+        for slot in range(min(stock, RESERVE_MAX_TRACKED_STOCK)):
+            slot_id = f"{key}#{slot}"
+            try:
+                await coll.insert_one({"_id": slot_id, "slot": slot, **fields})
+                return token
+            except DuplicateKeyError:
+                # taken: it is ours only if the holder's reservation has expired
+                took = await coll.find_one_and_update(
+                    {"_id": slot_id, "expires_at": {"$lte": now}}, {"$set": {"slot": slot, **fields}}
+                )
+                if took:
+                    return token
+        return None
+
+    async def attach_reservation(
+        self, token: str, order_id: str, ttl_seconds: int = ORDER_RESERVATION_TTL_SECONDS
+    ) -> bool:
+        """Tie a reservation to the order created from it and extend it. False if the slot
+        is no longer this buyer's (it expired and someone else took the unit)."""
+        result = await self._db["reservations"].update_one(
+            {"token": token},
+            {"$set": {"order_id": order_id, "expires_at": datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)}},
+        )
+        return result.matched_count == 1
+
+    async def release_reservation(self, *, token: str | None = None, order_id: str | None = None) -> int:
+        """Free the unit again (cancelled checkout, rejected or failed order, purchase done)."""
+        if token:
+            query = {"token": token}
+        elif order_id:
+            query = {"order_id": order_id}
+        else:
+            raise ValueError("release_reservation needs a token or an order id")
+        result = await self._db["reservations"].delete_many(query)
+        return result.deleted_count
 
     async def recent_orders(self, user_id: int, limit: int = 5) -> list[dict]:
         """A user's most recent orders, newest first.
