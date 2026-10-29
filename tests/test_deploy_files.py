@@ -75,3 +75,11 @@ def test_compose_bot_service_is_locked_down_and_has_no_inline_secrets():
 def test_gitignore_covers_secrets_and_backups():
     ignored = read(".gitignore").split()
     assert ".env" in ignored
+
+
+def test_backups_are_git_ignored_and_the_restore_docs_cover_the_key():
+    assert "backups/" in read(".gitignore").split()
+    deploy = read("DEPLOY.md")
+    assert "## Backup and restore" in deploy
+    assert "ENCRYPTION_KEY must be backed up separately" in deploy
+    assert "mongorestore" in deploy and "scripts/backup_mongo.sh" in deploy

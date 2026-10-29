@@ -79,3 +79,65 @@ Stopping mid-purchase is safe: on the next start, orders left `fulfilling` becom
 `reconcile/unknown` and the admin is alerted with the supplier client reference to check.
 Orders that were purchased but not delivered (`purchased_undelivered`) are delivered
 automatically after a restart.
+
+## Backup and restore
+
+### Take a backup
+
+Needs `mongodump` (MongoDB Database Tools) on the machine that runs it.
+
+```
+MONGODB_URI='mongodb+srv://...' ./scripts/backup_mongo.sh
+```
+
+This writes `backups/<db>_<UTC timestamp>.archive.gz` (+ a `.sha256`), private to the owner. The
+URI is passed to `mongodump` through a short-lived private config file, never on the command
+line. Useful variables: `MONGODB_DB`, `BACKUP_DIR`, and `BACKUP_RETENTION_DAYS` (prunes this
+script's own old backups). Example nightly cron entry:
+
+```
+17 3 * * *  cd /opt/prime-subs-bot && set -a && . ./.env && set +a && BACKUP_RETENTION_DAYS=30 ./scripts/backup_mongo.sh
+```
+
+A backup contains customer ids, payment proofs and **encrypted** credentials. Copy backups off the
+machine (and ideally encrypt them there), and treat them as sensitive. A free Atlas cluster has no
+automatic backups, so run this on a schedule.
+
+### ENCRYPTION_KEY must be backed up separately
+
+Purchased credentials are stored encrypted with `ENCRYPTION_KEY`, and **the key is not in the
+backup**. Without it a restored database is useless for credentials: My Orders cannot show them
+and automatic redelivery cannot decrypt them. So:
+
+- Store `ENCRYPTION_KEY` in a password manager / secrets vault, **in a different place from the
+  backups** (backups and key together defeat the encryption).
+- If you rotate the key, put the new key first and keep the old one(s) after it, comma-separated,
+  for as long as any backup or order still uses them.
+- Test that the key you saved is the one in use before you need it.
+
+### Restore
+
+1. **Stop the bot.** Only one instance may run, and a running bot would write into the database
+   while you restore.
+2. Pick the archive and check it: `sha256sum -c <archive>.sha256`.
+3. **Rehearse in a scratch database first** (restores the dump under a different name, leaving the
+   live data alone):
+
+   ```
+   mongorestore --uri "$MONGODB_URI" --gzip --archive=backups/<file>.archive.gz --nsFrom 'prime_subs_bot.*' --nsTo 'prime_subs_bot_restore.*'
+   ```
+
+   Inspect `prime_subs_bot_restore` (order counts, a few documents), then drop it.
+4. Restore for real. `--drop` replaces the existing collections with the backup's:
+
+   ```
+   mongorestore --uri "$MONGODB_URI" --gzip --archive=backups/<file>.archive.gz --nsInclude 'prime_subs_bot.*' --drop
+   ```
+
+5. Start the bot with the **same `ENCRYPTION_KEY`** (and `MONGODB_DB`). On start it recreates the
+   indexes and recovers any order left `fulfilling` (they become `reconcile/unknown` and the admin
+   is alerted).
+6. **Reconcile the gap.** Orders placed or purchased after the backup are not in the restored
+   data. Compare Pandora's order list for that period with the restored orders, using the supplier
+   client references (`<order id>-<attempt>`), and handle any purchase the database does not know
+   about by hand.
