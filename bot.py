@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 
@@ -327,6 +328,34 @@ def retail_price(cost: float) -> float:
 # Fulfilment
 # --------------------------------------------------------------------------
 
+RETRY_AFTER_DEFAULT_SECONDS = 5.0
+RETRY_AFTER_MAX_SECONDS = 30.0
+_DELTA_SECONDS = re.compile(r"\d+(?:\.\d+)?")
+
+
+def parse_retry_after(value, now: datetime | None = None) -> float:
+    """How many seconds to wait, from a Retry-After header: either a number of seconds or an
+    HTTP date (RFC 9110). A missing or unreadable value gives the default; the wait is never
+    negative and never longer than the cap, so a bad header can neither crash a purchase nor
+    stall it."""
+    if value is None:
+        return RETRY_AFTER_DEFAULT_SECONDS
+    text = str(value).strip()
+    if _DELTA_SECONDS.fullmatch(text):
+        seconds = float(text)
+    else:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return RETRY_AFTER_DEFAULT_SECONDS
+        if when is None:
+            return RETRY_AFTER_DEFAULT_SECONDS
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - (now or datetime.now(timezone.utc))).total_seconds()
+    return min(max(seconds, 0.0), RETRY_AFTER_MAX_SECONDS)
+
+
 def purchase_canboso(offer: Offer, order_id: str, max_cost: float, fence) -> tuple[list[str], float]:
     # Canboso's order-creation API isn't documented yet. Until it is implemented (and
     # CANBOSO_PURCHASE_IMPLEMENTED is set), Canboso is not live, so this is never reached.
@@ -389,7 +418,7 @@ def purchase_pandora(offer: Offer, order_id: str, max_cost: float, fence) -> tup
             continue
         if response.status_code == 429:
             maybe_placed = True  # conservative: not treated as a proven rejection
-            time.sleep(min(int(response.headers.get("Retry-After", "5")), 30))
+            time.sleep(parse_retry_after(response.headers.get("Retry-After")))
             continue
         if response.status_code >= 500:
             maybe_placed = True

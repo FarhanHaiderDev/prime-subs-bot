@@ -190,10 +190,11 @@ class FakePandora:
         self.order_status = 200
         self.order = {"id": "po_1", "status": "delivered", "delivery": {"items": ["user:pass"]}}
         self.raise_on_order = None  # an exception to raise on POST /orders (e.g. a network error)
+        self.order_queue = []  # scripted (status, body, headers) answers for POST /orders, used first
 
-    def _response(self, status, body):
+    def _response(self, status, body, headers=None):
         return SimpleNamespace(
-            ok=200 <= status < 300, status_code=status, headers={}, json=lambda: body
+            ok=200 <= status < 300, status_code=status, headers=headers or {}, json=lambda: body
         )
 
     def request(self, method, url, **kwargs):
@@ -203,6 +204,9 @@ class FakePandora:
         if url.endswith("/orders") and method == "POST":
             if self.raise_on_order:
                 raise self.raise_on_order
+            if self.order_queue:
+                status, body, headers = self.order_queue.pop(0)
+                return self._response(status, body, headers)
             return self._response(self.order_status, self.order)
         if "/orders/" in url and method == "GET":
             return self._response(200, self.order)
