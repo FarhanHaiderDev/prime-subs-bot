@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
+from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
 from storage import Storage
 
 load_dotenv()
@@ -91,6 +92,17 @@ FENCE_TIMEOUT = 20
 CATALOG_TTL = 30
 
 dp = Dispatcher()
+
+# Spam protection, per user (the admin is exempt). Messages and button presses are throttled
+# by outer middleware; payment-proof attempts have their own, stricter limit (see
+# receive_reference).
+message_limiter = RateLimitMiddleware(SlidingWindowLimiter(8, 10), is_exempt=lambda uid: is_admin(uid))
+button_limiter = RateLimitMiddleware(
+    SlidingWindowLimiter(15, 10), is_exempt=lambda uid: is_admin(uid), notice_each_event=True
+)
+proof_limiter = SlidingWindowLimiter(5, 600)  # 5 payment-proof attempts per 10 minutes
+dp.message.outer_middleware(message_limiter)
+dp.callback_query.outer_middleware(button_limiter)
 
 
 class Checkout(StatesGroup):
@@ -1099,6 +1111,13 @@ async def cmd_cancel(message: Message, state: FSMContext):
 # Registered after /cancel, and commands are excluded so they never reach the validator.
 @dp.message(Checkout.waiting_reference, F.text, ~F.text.startswith("/"))
 async def receive_reference(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        wait = proof_limiter.check(message.from_user.id)
+        if wait:
+            await message.answer(
+                f"You have submitted too many payment proofs. Please wait {wait_text(wait)} and try again."
+            )
+            return
     reference = message.text.strip()
     data = await state.get_data()
     method = PAYMENT_METHODS[data["method"]]
