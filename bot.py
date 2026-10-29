@@ -35,6 +35,13 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 # Supplier 1 (Canboso): X-API-Key header.
 SUPPLIER_API_KEY = os.getenv("SUPPLIER_API_KEY")
 CANBOSO_PRODUCTS_URL = "https://canboso.com/api/v2/telegram-buyer/products"
+# Canboso is OFF until its purchase flow is real. While off it is neither listed nor
+# priced nor used for fulfilment, so a cheaper Canboso offer can never set a price that
+# Pandora (the only implemented source) cannot honour.
+CANBOSO_ENABLED = (os.getenv("CANBOSO_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
+# Flip to True in the same change that implements purchase_canboso(); startup refuses
+# CANBOSO_ENABLED=true while this is False.
+CANBOSO_PURCHASE_IMPLEMENTED = False
 
 # Supplier 2 (Pandora Digital): Bearer token.
 SUPPLIER_2_API_KEY = os.getenv("SUPPLIER_2_API_KEY")
@@ -220,14 +227,24 @@ def fetch_pandora() -> list[dict]:
 _catalog_cache: tuple[float, dict[str, Listing]] | None = None
 
 
+def supplier_is_live(name: str) -> bool:
+    """A supplier is used for listing, pricing and fulfilment only if it is configured
+    and its purchase flow is actually implemented and switched on."""
+    if name == "pandora":
+        return bool(SUPPLIER_2_API_KEY)
+    if name == "canboso":
+        return CANBOSO_ENABLED and CANBOSO_PURCHASE_IMPLEMENTED and bool(SUPPLIER_API_KEY)
+    return False
+
+
 def build_catalog() -> dict[str, Listing]:
-    """Query both suppliers, merge matching products, cheapest offer first."""
+    """Query the live suppliers, merge matching products, cheapest offer first."""
     raw: list[dict] = []
-    for name, fetch, configured in (
-        ("canboso", fetch_canboso, SUPPLIER_API_KEY),
-        ("pandora", fetch_pandora, SUPPLIER_2_API_KEY),
+    for name, fetch in (
+        ("canboso", fetch_canboso),
+        ("pandora", fetch_pandora),
     ):
-        if not configured:
+        if not supplier_is_live(name):
             continue
         try:
             raw.extend(fetch())
@@ -270,7 +287,8 @@ def retail_price(cost: float) -> float:
 # --------------------------------------------------------------------------
 
 def purchase_canboso(offer: Offer, order_id: str, max_cost: float, fence) -> list[str]:
-    # Canboso's order-creation API isn't documented yet; fail over to Pandora.
+    # Canboso's order-creation API isn't documented yet. Until it is implemented (and
+    # CANBOSO_PURCHASE_IMPLEMENTED is set), Canboso is not live, so this is never reached.
     raise SupplierError("Canboso automatic purchase is not implemented")
 
 
@@ -381,8 +399,12 @@ def fulfil(order: dict, fence) -> tuple[list[str], Offer, list[str]]:
     max_cost = (order["price"] - MARKUP_FIXED) / (1 + MARKUP_PERCENT / 100) + 0.01
     # A new attempt (after a definitive failure) needs a fresh idempotency key.
     purchase_ref = purchase_ref_for(order)
-    for raw in order["offers"]:
-        offer = Offer(**raw)
+    # Only sources that are actually live are considered (an order stored with an offer
+    # from a source that is no longer live must not try it).
+    live_offers = [Offer(**raw) for raw in order["offers"] if supplier_is_live(raw["supplier"])]
+    if not live_offers:
+        raise SupplierError("no live supplier is available for this order")
+    for offer in live_offers:
         try:
             return PURCHASERS[offer.supplier](offer, purchase_ref, max_cost, fence), offer, failures
         except SupplierError as exc:
@@ -1662,8 +1684,12 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable is not set.")
-    if not SUPPLIER_API_KEY and not SUPPLIER_2_API_KEY:
-        raise SystemExit("Set SUPPLIER_API_KEY and/or SUPPLIER_2_API_KEY.")
+    if CANBOSO_ENABLED and not CANBOSO_PURCHASE_IMPLEMENTED:
+        raise SystemExit(
+            "CANBOSO_ENABLED is set but Canboso purchases are not implemented yet; unset it."
+        )
+    if not (supplier_is_live("pandora") or supplier_is_live("canboso")):
+        raise SystemExit("No live supplier: set SUPPLIER_2_API_KEY (Pandora).")
     if not ADMIN_CHAT_ID:
         raise SystemExit("ADMIN_CHAT_ID environment variable is not set.")
 
