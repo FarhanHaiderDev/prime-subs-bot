@@ -38,8 +38,35 @@ INTERRUPTED_REASON = (
 # Orders with these outcomes can't be claimed for fulfilment or rejected.
 BLOCKING_OUTCOMES = ["unknown", "purchased"]
 
+# Outbox: admin alerts and customer notices owed for an order are recorded ON the order,
+# in the same write as the state change that caused them, so a stop before they are sent
+# cannot lose them. Failed sends back off exponentially (60 s, 120 s, ... capped at 1 h).
+ALERT_BACKOFF_BASE_SECONDS = 60
+ALERT_BACKOFF_MAX_SECONDS = 3600
+MAX_NOTICE_ATTEMPTS = 8  # a customer who blocked the bot is given up on; the admin alert never is
+
 REFERENCE_INDEX = "reference_lower_unique"
 USER_ORDERS_INDEX = "user_id_created_at"
+
+
+def backoff_seconds(attempts: int) -> int:
+    """Delay before the next send after `attempts` failures: 60, 120, 240 ... capped at 1 hour."""
+    attempts = max(int(attempts), 1)
+    return min(ALERT_BACKOFF_BASE_SECONDS * 2 ** (attempts - 1), ALERT_BACKOFF_MAX_SECONDS)
+
+
+def outbox_fields(kind: str) -> dict:
+    """Fields to merge into a state-change update so the admin alert (`kind`: held,
+    reconcile, recovered, ...) and the customer notice are owed durably."""
+    return {
+        "alert_pending": True,
+        "alert_kind": kind,
+        "alert_attempts": 0,
+        "alert_next_at": None,
+        "notice_pending": True,
+        "notice_attempts": 0,
+        "notice_next_at": None,
+    }
 
 
 def resolve_lang(value: object) -> str:
@@ -205,6 +232,13 @@ class Storage:
         await self._orders.create_index(
             [("user_id", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
             name=USER_ORDERS_INDEX,
+        )
+        # Small sparse indexes: only orders that owe an alert/notice are in them.
+        await self._orders.create_index(
+            [("alert_pending", ASCENDING), ("alert_next_at", ASCENDING)], name="alert_outbox", sparse=True
+        )
+        await self._orders.create_index(
+            [("notice_pending", ASCENDING), ("notice_next_at", ASCENDING)], name="notice_outbox", sparse=True
         )
 
         report = await self.audit_references()
@@ -398,6 +432,7 @@ class Storage:
                                 "$cond": [{"$eq": ["$outcome", "purchased"]}, "purchased", "unknown"]
                             },
                             "error": INTERRUPTED_REASON,
+                            **outbox_fields("recovered"),
                         }
                     }
                 ],
@@ -469,6 +504,76 @@ class Storage:
             {"$set": {"status": "delivered", "delivered_at": datetime.now(timezone.utc)}},
         )
         return result.matched_count == 1
+
+    async def alerts_due(self, limit: int = 20) -> list[dict]:
+        """Orders that owe the admin an alert whose backoff has elapsed."""
+        now = datetime.now(timezone.utc)
+        cursor = (
+            self._orders.find(
+                {"alert_pending": True, "$or": [{"alert_next_at": None}, {"alert_next_at": {"$lte": now}}]}
+            )
+            .sort("_id", ASCENDING)
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
+    async def mark_alert_sent(self, order_id: str) -> bool:
+        result = await self._orders.update_one(
+            {"_id": order_id, "alert_pending": True},
+            {"$set": {"alert_pending": False, "alert_sent_at": datetime.now(timezone.utc)}},
+        )
+        return result.matched_count == 1
+
+    async def record_alert_failure(self, order_id: str) -> int:
+        """Count a failed alert and schedule the next try with exponential backoff."""
+        order = await self._orders.find_one_and_update(
+            {"_id": order_id, "alert_pending": True},
+            {"$inc": {"alert_attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if order is None:
+            return 0
+        attempts = int(order.get("alert_attempts", 1))
+        next_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds(attempts))
+        await self._orders.update_one({"_id": order_id}, {"$set": {"alert_next_at": next_at}})
+        return attempts
+
+    async def notices_due(self, limit: int = 20) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        cursor = (
+            self._orders.find(
+                {"notice_pending": True, "$or": [{"notice_next_at": None}, {"notice_next_at": {"$lte": now}}]}
+            )
+            .sort("_id", ASCENDING)
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
+    async def mark_notice_sent(self, order_id: str) -> bool:
+        result = await self._orders.update_one(
+            {"_id": order_id, "notice_pending": True},
+            {"$set": {"notice_pending": False, "notice_sent_at": datetime.now(timezone.utc)}},
+        )
+        return result.matched_count == 1
+
+    async def record_notice_failure(self, order_id: str) -> int:
+        """Count a failed customer notice; stop trying after MAX_NOTICE_ATTEMPTS."""
+        order = await self._orders.find_one_and_update(
+            {"_id": order_id, "notice_pending": True},
+            {"$inc": {"notice_attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if order is None:
+            return 0
+        attempts = int(order.get("notice_attempts", 1))
+        if attempts >= MAX_NOTICE_ATTEMPTS:
+            await self._orders.update_one(
+                {"_id": order_id}, {"$set": {"notice_pending": False, "notice_gave_up": True}}
+            )
+        else:
+            next_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds(attempts))
+            await self._orders.update_one({"_id": order_id}, {"$set": {"notice_next_at": next_at}})
+        return attempts
 
     async def recent_orders(self, user_id: int, limit: int = 5) -> list[dict]:
         """A user's most recent orders, newest first.

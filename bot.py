@@ -29,7 +29,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
 from logsetup import configure_logging, order_context, set_order_id
 from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
-from storage import Storage
+from storage import Storage, outbox_fields
 
 load_dotenv()
 
@@ -1483,78 +1483,181 @@ async def approve_order(callback: CallbackQuery):
             )
 
 
+CUSTOMER_DELAY_NOTICE = (
+    "Your payment is confirmed, but delivery is delayed. "
+    "Our team has been notified and will sort it out shortly."
+)
+# Statuses in which the customer no longer needs a "delayed" notice.
+NOTICE_OBSOLETE_STATUSES = {"rejected", "delivered", "purchased_undelivered", "delivery_failed"}
+
+
 async def hold_order(bot: Bot, order: dict, reason: str, *, attempt: int | None = None) -> None:
-    """Park an order after a PROVEN no-purchase failure; ordinary Retry/Reject apply."""
-    fields = {"status": "held", "outcome": "definitive_failure", "error": reason}
+    """Park an order after a PROVEN no-purchase failure; ordinary Retry/Reject apply.
+
+    The admin alert and the customer notice are recorded on the order in the same write as
+    the state change, then sent; if sending fails they are retried with backoff, also after
+    a restart (see flush_outbox)."""
+    fields = {"status": "held", "outcome": "definitive_failure", "error": reason, **outbox_fields("held")}
     if attempt is not None:
         fields["attempt"] = attempt
     result = await persist_order(order["id"], fields, "fulfilling", order["claim_token"])
     logging.error("Order %s held: %s", order["id"], reason)
-
-    summary = (
+    if result == SAVED:
+        await flush_one(bot, order["id"])
+        return
+    await alert_admin(
+        bot,
         f"🚨 EMERGENCY: order #{order['id']} is on hold\n"
         f"User: {order['user_label']}\n"
         f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
         f"Reason: {reason}\n\n"
-        "The customer has paid but has not received the product. "
+        "The customer has paid but has not received the product. " + unsaved_note(result),
+        order_id=order["id"],
     )
-    if result == SAVED:
-        await alert_admin(
-            bot,
-            summary + "No purchase was made. Fix the issue and tap Retry, or Reject to cancel.",
-            reply_markup=admin_keyboard(order["id"], retry=True),
-            order_id=order["id"],
-        )
-    else:
-        await alert_admin(bot, summary + unsaved_note(result), order_id=order["id"])
     await notify_delay(bot, order)
 
 
 async def reconcile_order(bot: Bot, order: dict, reason: str) -> None:
     """Park an order whose supplier outcome is unknown: no Retry or Reject, and no
-    attempt change, until an admin verifies and explicitly unlocks it."""
+    attempt change, until an admin verifies and explicitly unlocks it. Alert and customer
+    notice are durable, as in hold_order."""
     result = await persist_order(
         order["id"],
-        {
-            "status": "reconcile",
-            "outcome": "unknown",
-            "error": reason,
-        },
+        {"status": "reconcile", "outcome": "unknown", "error": reason, **outbox_fields("reconcile")},
         "fulfilling",
         order["claim_token"],
     )
     logging.error("Order %s needs manual reconciliation: %s", order["id"], reason)
-
-    summary = (
+    if result == SAVED:
+        await flush_one(bot, order["id"])
+        return
+    await alert_admin(
+        bot,
         f"🚨 MANUAL RECONCILIATION: order #{order['id']}\n"
         f"User: {order['user_label']}\n"
         f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
         f"Supplier client reference: {purchase_ref_for(order)}\n"
         f"Reason: {reason}\n\n"
         "The supplier purchase may or may not have happened. Check the supplier account for the "
-        "client reference above. Retry and Reject are blocked. "
+        "client reference above. Retry and Reject are blocked. " + unsaved_note(result),
+        order_id=order["id"],
     )
-    if result == SAVED:
-        await alert_admin(
-            bot,
-            summary + "Retry stays blocked until you confirm with Pandora that no purchase exists and no "
-            "request is still pending, and record that confirmation via the button below.",
-            reply_markup=reconcile_keyboard(order["id"]),
-            order_id=order["id"],
-        )
-    else:
-        await alert_admin(bot, summary + unsaved_note(result), order_id=order["id"])
     await notify_delay(bot, order)
 
 
 async def notify_delay(bot: Bot, order: dict) -> None:
+    """Best-effort customer notice for the cases where nothing could be recorded."""
     try:
-        await bot.send_message(
-            order["user_id"],
-            "Your payment is confirmed, but delivery is delayed. Our team has been notified and will sort it out shortly.",
-        )
+        await bot.send_message(order["user_id"], CUSTOMER_DELAY_NOTICE)
     except Exception:
         logging.exception("Could not notify user %s", order["user_id"])
+
+
+def order_alert(order: dict):
+    """The admin alert owed for an order, built from its CURRENT state, or None when the
+    order has moved on and the alert is no longer relevant. Never contains credentials;
+    an unlock button is offered only for an unknown outcome, never for a purchased order."""
+    status, outcome, kind = order["status"], order.get("outcome"), order.get("alert_kind")
+    head = (
+        f"Order #{order['id']}\n"
+        f"User: {order['user_label']}\n"
+        f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
+    )
+    reason = order.get("error", "-")
+    if kind == "held" and status == "held":
+        return (
+            "🚨 EMERGENCY: order is on hold\n" + head + f"Reason: {reason}\n\n"
+            "The customer has paid but has not received the product. No purchase was made. "
+            "Fix the issue and tap Retry, or Reject to cancel.",
+            admin_keyboard(order["id"], retry=True),
+        )
+    if kind in ("reconcile", "recovered") and status == "reconcile":
+        title = (
+            "⚠️ Order was interrupted by a restart and needs manual reconciliation"
+            if kind == "recovered"
+            else "🚨 MANUAL RECONCILIATION"
+        )
+        ref = f"Supplier client reference: {purchase_ref_for(order)}\n"
+        if outcome == "purchased":
+            return (title + "\n" + head + ref + "\nIt is recorded as PURCHASED. Never retry or reject it.", None)
+        return (
+            title + "\n" + head + ref + (f"Reason: {reason}\n" if kind == "reconcile" else "") + "\n"
+            "The supplier purchase may or may not have happened. Check the supplier account for the "
+            "client reference above. Retry and Reject are blocked until Pandora confirms that no "
+            "purchase exists and no request is still pending, and you record that confirmation.",
+            reconcile_keyboard(order["id"]),
+        )
+    return None
+
+
+async def deliver_order_alert(bot: Bot, order: dict) -> bool:
+    """Send the owed admin alert; the flag is cleared only after Telegram confirms."""
+    built = order_alert(order)
+    if built is not None:
+        text, markup = built
+        if not await alert_admin(bot, text, reply_markup=markup, order_id=order["id"]):
+            try:
+                attempts = await storage.record_alert_failure(order["id"])
+                logging.error("Order %s: admin alert failed (attempt %s); will retry with backoff", order["id"], attempts)
+            except PyMongoError as exc:
+                log_db_error("recording alert failure", exc, order=order["id"])
+            return False
+    try:  # sent, or no longer relevant
+        await storage.mark_alert_sent(order["id"])
+    except PyMongoError as exc:
+        log_db_error("clearing alert flag", exc, order=order["id"])  # a duplicate alert may follow
+    return True
+
+
+async def deliver_customer_notice(bot: Bot, order: dict) -> bool:
+    """Tell the customer their order is delayed; stops after MAX_NOTICE_ATTEMPTS failures."""
+    if order["status"] not in NOTICE_OBSOLETE_STATUSES:
+        try:
+            await bot.send_message(order["user_id"], CUSTOMER_DELAY_NOTICE)
+        except Exception as exc:
+            logging.error("Order %s: customer notice failed (%s)", order["id"], type(exc).__name__)
+            try:
+                await storage.record_notice_failure(order["id"])
+            except PyMongoError as db_exc:
+                log_db_error("recording notice failure", db_exc, order=order["id"])
+            return False
+    try:
+        await storage.mark_notice_sent(order["id"])
+    except PyMongoError as exc:
+        log_db_error("clearing notice flag", exc, order=order["id"])
+    return True
+
+
+async def flush_one(bot: Bot, order_id: str) -> None:
+    """Send what one order owes right now (used right after its state change)."""
+    try:
+        order = await storage.get_order(order_id)
+    except PyMongoError as exc:
+        log_db_error("loading order for its outbox", exc, order=order_id)
+        return
+    if order is None:
+        return
+    with order_context(order_id):
+        if order.get("alert_pending"):
+            await deliver_order_alert(bot, order)
+        if order.get("notice_pending"):
+            await deliver_customer_notice(bot, order)
+
+
+async def flush_outbox(bot: Bot) -> None:
+    """Send every alert and notice that is owed and whose backoff has elapsed. Safe to
+    repeat; this is what re-sends unsent alerts after a restart."""
+    try:
+        alerts, notices = await storage.alerts_due(), await storage.notices_due()
+    except PyMongoError as exc:
+        log_db_error("loading the outbox", exc)
+        return
+    for order in alerts:
+        with order_context(order["id"]):
+            await deliver_order_alert(bot, order)
+    for order in notices:
+        with order_context(order["id"]):
+            await deliver_customer_notice(bot, order)
 
 
 UNLOCK_NOTE_MIN, UNLOCK_NOTE_MAX = 3, 200
@@ -1841,7 +1944,7 @@ async def notify_pending_orders(bot: Bot) -> None:
 
 async def notification_retry_loop(bot: Bot) -> None:
     while True:
-        for background_pass in (notify_pending_orders, redeliver_undelivered):
+        for background_pass in (notify_pending_orders, redeliver_undelivered, flush_outbox):
             try:
                 await background_pass(bot)
             except Exception as exc:  # never let the loop die
@@ -1891,26 +1994,6 @@ async def on_error(event: ErrorEvent, bot: Bot) -> bool:
             "The full traceback is in the logs.",
         )
     return True
-
-
-async def announce_recovered(bot: Bot, order: dict) -> None:
-    purchased = order.get("outcome") == "purchased"
-    await alert_admin(
-        bot,
-        f"⚠️ Order #{order['id']} was interrupted by a restart and needs manual reconciliation.\n"
-        f"User: {order['user_label']}\n"
-        f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
-        f"Supplier client reference: {purchase_ref_for(order)}\n\n"
-        + (
-            "It is recorded as PURCHASED. Never retry or reject it."
-            if purchased
-            else "The supplier purchase may or may not have happened. Check the supplier account "
-            "for the client reference above. Retry and Reject are blocked until Pandora confirms that "
-            "no purchase exists and no request is still pending, and you record that confirmation."
-        ),
-        reply_markup=None if purchased else reconcile_keyboard(order["id"]),
-        order_id=order["id"],
-    )
 
 
 async def start_health_server() -> web.AppRunner:
@@ -1986,7 +2069,9 @@ async def main():
         for order in recovered:
             with order_context(order["id"]):
                 logging.warning("Recovered interrupted order %s into reconciliation", order["id"])
-                await announce_recovered(bot, order)
+        # Their alerts and customer notices are owed on the orders themselves; send them now,
+        # and the background loop keeps retrying (with backoff) until Telegram confirms.
+        await flush_outbox(bot)
 
         runner = await start_health_server()
         # Re-send any new-order alert that was never confirmed delivered (including after a restart).
