@@ -21,7 +21,7 @@ from aiogram.exceptions import (
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -1782,6 +1782,50 @@ async def notification_retry_loop(bot: Bot) -> None:
             except Exception as exc:  # never let the loop die
                 logging.error("Background pass %s failed (%s)", background_pass.__name__, type(exc).__name__)
         await asyncio.sleep(NOTIFY_RETRY_SECONDS)
+
+
+USER_ERROR_MESSAGE = "Sorry, something went wrong on our side. Please try again in a moment."
+ERROR_ALERT_INTERVAL = 60  # seconds between admin alerts for the same kind of error
+_last_error_alert: dict[str, float] = {}
+
+
+def update_kind(update) -> str:
+    for kind in ("message", "callback_query"):
+        if getattr(update, kind, None) is not None:
+            return kind
+    return "update"
+
+
+@dp.errors()
+async def on_error(event: ErrorEvent, bot: Bot) -> bool:
+    """Last line of defence for every handler: log the full traceback, tell the user
+    something neutral, and send the admin a SHORT alert.
+
+    The alert carries only the exception type and the update kind/id: no message text, no
+    exception message (it can contain data) and nothing from the order. Alerts for the same
+    exception type are throttled so a failing handler cannot flood the admin chat."""
+    exc, update = event.exception, event.update
+    kind = update_kind(update)
+    logging.error("Unhandled %s in a %s handler", type(exc).__name__, kind, exc_info=exc)
+
+    try:
+        if getattr(update, "callback_query", None) is not None:
+            await update.callback_query.answer(USER_ERROR_MESSAGE, show_alert=True)
+        elif getattr(update, "message", None) is not None:
+            await update.message.answer(USER_ERROR_MESSAGE)
+    except Exception as notify_exc:
+        logging.error("Could not send the error notice to the user (%s)", type(notify_exc).__name__)
+
+    error_name = type(exc).__name__
+    now = time.monotonic()
+    if now - _last_error_alert.get(error_name, float("-inf")) >= ERROR_ALERT_INTERVAL:
+        _last_error_alert[error_name] = now
+        await alert_admin(
+            bot,
+            f"⚠️ Unhandled {error_name} while handling a {kind} (update {getattr(update, 'update_id', '?')}). "
+            "The full traceback is in the logs.",
+        )
+    return True
 
 
 async def start_health_server() -> web.AppRunner:
