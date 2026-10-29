@@ -4,6 +4,7 @@ Database errors (pymongo.errors.PyMongoError and subclasses) propagate to the
 caller on purpose, so each call site can decide how to degrade.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -301,6 +302,7 @@ class Storage:
         await self.fsm_collection.create_index(
             "updated_at", expireAfterSeconds=FSM_TTL_SECONDS, name="fsm_ttl"
         )  # abandoned flows are cleaned up after a week
+        await self._db["audit_log"].create_index("order_id", name="audit_order")
         reservations = self._db["reservations"]
         await reservations.create_index("expires_at", expireAfterSeconds=0, name="reservation_ttl")
         await reservations.create_index("token", name="reservation_token")
@@ -734,6 +736,49 @@ class Storage:
             },
             return_document=ReturnDocument.AFTER,
         )
+
+    async def unblock_reference(self, reference: str, admin_id: int, reason: str):
+        """Free the payment proof of a REJECTED order so it can be used again.
+
+        Returns (code, order) with code "unblocked", "not_found" (no order uses that proof) or
+        "not_rejected" (it belongs to an order that is not rejected: nothing is changed).
+        The rejected order keeps its record but loses its unique key (reference_lower), and
+        who unblocked it, when and why are stored on it. An entry is written to the audit log
+        BEFORE the change (result "pending") and completed after it, so a crash in between
+        leaves a visible trace. The log holds a hash of the proof, never the proof. Raises
+        ValueError for a blank reference."""
+        canonical = normalize_reference(reference)
+        order = await self._orders.find_one({"reference_lower": canonical})
+        if order is None:
+            return "not_found", None
+        if order["status"] != "rejected":
+            return "not_rejected", order
+
+        now = datetime.now(timezone.utc)
+        audit = self._db["audit_log"]
+        entry = await audit.insert_one(
+            {
+                "at": now,
+                "admin_id": str(admin_id),
+                "action": "unblock_reference",
+                "order_id": order["_id"],
+                "reference_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+                "reason": reason,
+                "result": "pending",
+            }
+        )
+        updated = await self._orders.find_one_and_update(
+            {"_id": order["_id"], "status": "rejected", "reference_lower": canonical},
+            {
+                "$unset": {"reference_lower": ""},
+                "$set": {"unblocked_at": now, "unblocked_by": str(admin_id), "unblock_reason": reason},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        await audit.update_one(
+            {"_id": entry.inserted_id}, {"$set": {"result": "done" if updated else "refused"}}
+        )
+        return ("unblocked", updated) if updated else ("not_rejected", order)
 
     async def recent_orders(self, user_id: int, limit: int = 5) -> list[dict]:
         """A user's most recent orders, newest first.

@@ -141,3 +141,12 @@ and automatic redelivery cannot decrypt them. So:
    data. Compare Pandora's order list for that period with the restored orders, using the supplier
    client references (`<order id>-<attempt>`), and handle any purchase the database does not know
    about by hand.
+
+## Admin commands
+
+Only the account in `ADMIN_CHAT_ID` can use these (anyone else is ignored). They are not in the
+public command menu.
+
+| Command | What it does |
+|---|---|
+| `/unblock <payment proof> <reason>` | Frees the payment proof (TXID / Binance order ID) of a **rejected** order so it can be submitted again. The reason (3-200 characters) is required and goes to the `audit_log` collection together with your id, the time, the order id and a hash of the proof. Orders that are not rejected are never touched. |

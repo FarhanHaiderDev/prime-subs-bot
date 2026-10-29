@@ -18,7 +18,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton, Message
@@ -2222,6 +2222,48 @@ def install_fsm_storage(db_storage: Storage) -> None:
     """Keep conversation state (checkout, search, unlock flows) in MongoDB instead of memory,
     so it survives a restart."""
     dp.fsm.storage = MongoFSMStorage(db_storage.fsm_collection)
+
+
+UNBLOCK_USAGE = (
+    "Usage: /unblock <payment proof> <reason>\n"
+    "Frees the payment proof (TXID / Binance order ID) of a REJECTED order so it can be used "
+    "again. A reason of 3-200 characters is required and is written to the audit log."
+)
+
+
+@dp.message(Command("unblock"))
+async def cmd_unblock(message: Message, command: CommandObject):
+    """Admin only (silently ignored for everyone else): unblock a rejected payment proof."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = (command.args or "").split(None, 1)
+    reason = " ".join(parts[1].split()) if len(parts) == 2 else ""
+    if not 3 <= len(reason) <= 200:
+        await message.answer(UNBLOCK_USAGE)
+        return
+    try:
+        code, order = await storage.unblock_reference(parts[0], message.from_user.id, reason)
+    except ValueError:
+        await message.answer(UNBLOCK_USAGE)
+        return
+    except PyMongoError as exc:
+        log_db_error("unblocking a payment proof", exc, user=message.from_user.id)
+        await message.answer("Database error - nothing was changed. Try again.")
+        return
+    if code == "not_found":
+        await message.answer("No order uses that payment proof.")
+    elif code == "not_rejected":
+        await message.answer(
+            f"That proof belongs to order #{order['id']}, which is {order['status']}, not rejected. "
+            "Only a rejected order's proof can be unblocked. Nothing was changed."
+        )
+    else:
+        with order_context(order["id"]):
+            logging.warning("Admin %s unblocked the payment proof of rejected order %s", message.from_user.id, order["id"])
+        await message.answer(
+            f"✅ The payment proof of rejected order #{order['id']} ({order['user_label']}) can be used again. "
+            "The change was recorded in the audit log."
+        )
 
 
 def update_kind(update) -> str:
