@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
+from logsetup import configure_logging, order_context, set_order_id
 from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
 from storage import Storage
 
@@ -1139,6 +1140,7 @@ async def receive_reference(message: Message, state: FSMContext):
 
     user = message.from_user
     order_id = uuid.uuid4().hex[:10]
+    set_order_id(order_id)
     order = {
         "id": order_id,
         "status": "pending",
@@ -1200,6 +1202,7 @@ async def reject_order(callback: CallbackQuery):
         await callback.answer("Not allowed", show_alert=True)
         return
     order_id = callback.data.split(":", 1)[1]
+    set_order_id(order_id)
     try:
         # Refuses orders that are fulfilling or need manual reconciliation.
         order = await storage.reject_order(order_id)
@@ -1230,6 +1233,7 @@ async def approve_order(callback: CallbackQuery):
         await callback.answer("Not allowed", show_alert=True)
         return
     order_id = callback.data.split(":", 1)[1]
+    set_order_id(order_id)
 
     # The atomic pending/held -> fulfilling claim is the only gate to a supplier call.
     try:
@@ -1544,6 +1548,7 @@ async def unlock_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Not allowed", show_alert=True)
         return
     order_id = callback.data.split(":", 1)[1]
+    set_order_id(order_id)
     try:
         order = await unlockable_order(order_id)
     except PyMongoError as exc:
@@ -1586,6 +1591,7 @@ async def unlock_note(message: Message, state: FSMContext):
         )
         return
     order_id = (await state.get_data())["order_id"]
+    set_order_id(order_id)
     try:
         order = await unlockable_order(order_id)
     except PyMongoError as exc:
@@ -1633,6 +1639,7 @@ async def unlock_confirm(callback: CallbackQuery, state: FSMContext):
         )
         return
     order_id, note = data["order_id"], data["note"]
+    set_order_id(order_id)
     try:
         order = await storage.unlock_order(order_id, callback.from_user.id, note)
     except PyMongoError as exc:
@@ -1741,33 +1748,38 @@ async def redeliver_undelivered(bot: Bot) -> None:
         log_db_error("loading undelivered orders", exc)
         return
     for order in due:
+        with order_context(order["id"]):
+            await _redeliver_one(bot, order)
+
+
+async def _redeliver_one(bot: Bot, order: dict) -> None:
+    try:
+        credentials = credbox.decrypt_list(order["credentials_enc"])
+    except (CredentialDecryptError, KeyError):
+        logging.error("Order %s: undelivered credentials could not be decrypted", order["id"])
+        return
+    if await deliver_credentials(bot, order, credentials):
         try:
-            credentials = credbox.decrypt_list(order["credentials_enc"])
-        except (CredentialDecryptError, KeyError):
-            logging.error("Order %s: undelivered credentials could not be decrypted", order["id"])
-            continue
-        if await deliver_credentials(bot, order, credentials):
-            try:
-                await storage.mark_delivered(order["id"])
-            except PyMongoError as exc:
-                log_db_error("marking order delivered", exc, order=order["id"])
-            continue
-        try:
-            attempts = await storage.record_delivery_failure(order["id"])
+            await storage.mark_delivered(order["id"])
         except PyMongoError as exc:
-            log_db_error("recording delivery failure", exc, order=order["id"])
-            continue
-        if attempts >= MAX_AUTO_DELIVERY_ATTEMPTS:
-            await alert_admin(
-                bot,
-                f"🚨 Order #{order['id']}: automatic delivery failed {attempts} times and has stopped. "
-                f"The customer may have blocked the bot.\nUser: {order['user_label']}\n"
-                "Forward the credentials manually (the order stays purchased_undelivered):\n\n"
-                + "\n".join(credentials),
-                protect_content=True,
-                attempts=5,
-                order_id=order["id"],
-            )
+            log_db_error("marking order delivered", exc, order=order["id"])
+        return
+    try:
+        attempts = await storage.record_delivery_failure(order["id"])
+    except PyMongoError as exc:
+        log_db_error("recording delivery failure", exc, order=order["id"])
+        return
+    if attempts >= MAX_AUTO_DELIVERY_ATTEMPTS:
+        await alert_admin(
+            bot,
+            f"🚨 Order #{order['id']}: automatic delivery failed {attempts} times and has stopped. "
+            f"The customer may have blocked the bot.\nUser: {order['user_label']}\n"
+            "Forward the credentials manually (the order stays purchased_undelivered):\n\n"
+            + "\n".join(credentials),
+            protect_content=True,
+            attempts=5,
+            order_id=order["id"],
+        )
 
 
 async def notify_pending_orders(bot: Bot) -> None:
@@ -1779,18 +1791,19 @@ async def notify_pending_orders(bot: Bot) -> None:
         log_db_error("loading unnotified orders", exc)
         return
     for order in unnotified:
-        delivered = await alert_admin(
-            bot,
-            new_order_alert(order, delayed=True),
-            reply_markup=admin_keyboard(order["id"]),
-            order_id=order["id"],
-        )
-        if not delivered:
-            return  # Telegram is still unavailable: retry the whole batch next round
-        try:
-            await storage.mark_admin_notified(order["id"])
-        except PyMongoError as exc:
-            log_db_error("recording admin notification", exc, order=order["id"])
+        with order_context(order["id"]):
+            delivered = await alert_admin(
+                bot,
+                new_order_alert(order, delayed=True),
+                reply_markup=admin_keyboard(order["id"]),
+                order_id=order["id"],
+            )
+            if not delivered:
+                return  # Telegram is still unavailable: retry the whole batch next round
+            try:
+                await storage.mark_admin_notified(order["id"])
+            except PyMongoError as exc:
+                log_db_error("recording admin notification", exc, order=order["id"])
 
 
 async def notification_retry_loop(bot: Bot) -> None:
@@ -1847,6 +1860,26 @@ async def on_error(event: ErrorEvent, bot: Bot) -> bool:
     return True
 
 
+async def announce_recovered(bot: Bot, order: dict) -> None:
+    purchased = order.get("outcome") == "purchased"
+    await alert_admin(
+        bot,
+        f"⚠️ Order #{order['id']} was interrupted by a restart and needs manual reconciliation.\n"
+        f"User: {order['user_label']}\n"
+        f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
+        f"Supplier client reference: {purchase_ref_for(order)}\n\n"
+        + (
+            "It is recorded as PURCHASED. Never retry or reject it."
+            if purchased
+            else "The supplier purchase may or may not have happened. Check the supplier account "
+            "for the client reference above. Retry and Reject are blocked until Pandora confirms that "
+            "no purchase exists and no request is still pending, and you record that confirmation."
+        ),
+        reply_markup=None if purchased else reconcile_keyboard(order["id"]),
+        order_id=order["id"],
+    )
+
+
 async def start_health_server() -> web.AppRunner:
     """Tiny HTTP server so hosts like Render see an open port and a healthy service."""
     async def health(_request: web.Request) -> web.Response:
@@ -1863,7 +1896,7 @@ async def start_health_server() -> web.AppRunner:
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable is not set.")
     if CANBOSO_ENABLED and not CANBOSO_PURCHASE_IMPLEMENTED:
@@ -1916,23 +1949,9 @@ async def main():
         except PyMongoError as exc:
             raise SystemExit(f"Could not recover interrupted orders ({type(exc).__name__}).")
         for order in recovered:
-            purchased = order.get("outcome") == "purchased"
-            await alert_admin(
-                bot,
-                f"⚠️ Order #{order['id']} was interrupted by a restart and needs manual reconciliation.\n"
-                f"User: {order['user_label']}\n"
-                f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
-                f"Supplier client reference: {purchase_ref_for(order)}\n\n"
-                + (
-                    "It is recorded as PURCHASED. Never retry or reject it."
-                    if purchased
-                    else "The supplier purchase may or may not have happened. Check the supplier account "
-                    "for the client reference above. Retry and Reject are blocked until Pandora confirms that "
-                    "no purchase exists and no request is still pending, and you record that confirmation."
-                ),
-                reply_markup=None if purchased else reconcile_keyboard(order["id"]),
-                order_id=order["id"],
-            )
+            with order_context(order["id"]):
+                logging.warning("Recovered interrupted order %s into reconciliation", order["id"])
+                await announce_recovered(bot, order)
 
         runner = await start_health_server()
         # Re-send any new-order alert that was never confirmed delivered (including after a restart).

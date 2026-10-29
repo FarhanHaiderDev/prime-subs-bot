@@ -166,6 +166,7 @@ class FakePandora:
         self.quote = {"can_purchase": True, "unit_price": "3.00", "price_version": "v1"}
         self.order_status = 200
         self.order = {"id": "po_1", "status": "delivered", "delivery": {"items": ["user:pass"]}}
+        self.raise_on_order = None  # an exception to raise on POST /orders (e.g. a network error)
 
     def _response(self, status, body):
         return SimpleNamespace(
@@ -177,6 +178,8 @@ class FakePandora:
         if url.endswith("/quotes"):
             return self._response(200, self.quote)
         if url.endswith("/orders") and method == "POST":
+            if self.raise_on_order:
+                raise self.raise_on_order
             return self._response(self.order_status, self.order)
         if "/orders/" in url and method == "GET":
             return self._response(200, self.order)
