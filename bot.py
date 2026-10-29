@@ -423,7 +423,10 @@ RETRY_LATER = (
     "Sorry, something went wrong on our side and your order was not saved. "
     "Please send your reference again in a moment."
 )
-DUPLICATE_REFERENCE = "That reference has already been submitted. Contact support if this is a mistake."
+DUPLICATE_REFERENCE = (
+    "This payment proof (transaction hash / Binance order ID) has already been used for another order. "
+    "Each proof can back only one order. If you believe this is a mistake, please contact support."
+)
 PURCHASED_UNRESOLVED = (
     "The supplier purchase completed but its credentials could not be stored. "
     "Reconcile manually; never retry or reject."
@@ -1126,8 +1129,11 @@ async def receive_reference(message: Message, state: FSMContext):
     # Persist before confirming; keep the checkout state if this fails so the user can resend.
     try:
         await storage.insert_order(order)
-    except DuplicateKeyError:  # lost a race with another submission of the same reference
-        await message.answer(DUPLICATE_REFERENCE)
+    except DuplicateKeyError as exc:
+        # Lost a race with another submission of the same payment proof (the unique index
+        # on reference_lower rejected it). An order-id collision is not the user's doing.
+        key_pattern = (getattr(exc, "details", None) or {}).get("keyPattern") or {}
+        await message.answer(RETRY_LATER if "_id" in key_pattern else DUPLICATE_REFERENCE)
         return
     except PyMongoError as exc:
         log_db_error("saving new order", exc, order=order_id, user=user.id)

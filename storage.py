@@ -6,6 +6,7 @@ caller on purpose, so each call site can decide how to degrade.
 
 import logging
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -46,11 +47,22 @@ def resolve_lang(value: object) -> str:
     return value if isinstance(value, str) and value in SUPPORTED_LANGS else DEFAULT_LANG
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def normalize_reference(reference: object) -> str:
-    """The one canonical form of a payment reference: trimmed and case-folded."""
+    """The one canonical form of a payment proof (a blockchain TXID or a Binance order ID).
+
+    Trimmed and case-folded, and a "0x" prefix on a 64-hex transaction hash is dropped,
+    because `0x<hash>` and `<hash>` are the same transaction. This canonical form is what
+    the unique index on `reference_lower` enforces, so one proof can back only one order.
+    """
     if not isinstance(reference, str) or not reference.strip():
         raise ValueError("reference must be a non-empty string")
-    return reference.strip().casefold()
+    canonical = reference.strip().casefold()
+    if canonical.startswith("0x") and _HEX64.fullmatch(canonical[2:]):
+        canonical = canonical[2:]
+    return canonical
 
 
 def coerce_created_at(value: object) -> datetime:
