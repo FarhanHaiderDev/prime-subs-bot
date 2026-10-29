@@ -58,6 +58,22 @@ RESERVE_MAX_TRACKED_STOCK = 50  # plentiful stock is not worth reserving
 REFERENCE_INDEX = "reference_lower_unique"
 USER_ORDERS_INDEX = "user_id_created_at"
 
+# Finished orders never change again. The startup audit skips them (a range scan on the
+# status index, not a read of the whole collection): the unique index itself covers them.
+# Any other status, including an unknown or missing one, is audited.
+TERMINAL_STATUSES = ["delivered", "rejected", "delivery_failed"]
+
+# Indexes for the status-based scans: (name, keys, options).
+ORDER_INDEXES = [
+    (USER_ORDERS_INDEX, [("user_id", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)], {}),
+    ("status_created", [("status", ASCENDING), ("created_at", ASCENDING)], {}),  # audit, recovery, any status scan
+    ("status_notified", [("status", ASCENDING), ("admin_notified", ASCENDING)], {}),  # unannounced new orders
+    ("status_purchased", [("status", ASCENDING), ("purchased_at", ASCENDING)], {}),  # undelivered redelivery
+    # Small sparse indexes: only orders that owe an alert/notice are in them.
+    ("alert_outbox", [("alert_pending", ASCENDING), ("alert_next_at", ASCENDING)], {"sparse": True}),
+    ("notice_outbox", [("notice_pending", ASCENDING), ("notice_next_at", ASCENDING)], {"sparse": True}),
+]
+
 
 def backoff_seconds(attempts: int) -> int:
     """Delay before the next send after `attempts` failures: 60, 120, 240 ... capped at 1 hour."""
@@ -141,11 +157,16 @@ class IndexReport:
     stale_reference_lower: list[str] = field(default_factory=list)
     # Order ids whose `reference` itself is absent, blank or not a string.
     invalid_reference: list[str] = field(default_factory=list)
+    # "active" = only the orders that are not finished were examined; "full" = every order.
+    scanned: str = "active"
+    # The unique index could not be built because existing data already holds a duplicate.
+    index_blocked: bool = False
 
     @property
     def has_problems(self) -> bool:
         return bool(
-            self.duplicate_references
+            self.index_blocked
+            or self.duplicate_references
             or self.missing_reference_lower
             or self.stale_reference_lower
             or self.invalid_reference
@@ -207,16 +228,25 @@ class Storage:
 
     # ---- Indexes (separate from connect so callers decide when to run it) ----
 
-    async def audit_references(self) -> IndexReport:
-        """Read-only check of every order's reference fields.
+    async def audit_references(self, full: bool = False) -> IndexReport:
+        """Read-only check of the orders' reference fields.
 
-        The canonical reference is always derived from `reference`, so duplicates
-        are found even when `reference_lower` is missing or stale.
+        By default only orders that are not finished (not in TERMINAL_STATUSES) are examined,
+        through the status index, so startup does not read the whole collection. `full=True` examines
+        every order and is only used to explain why the unique index could not be built.
+        The canonical reference is always derived from `reference`, so duplicates are found
+        even when `reference_lower` is missing or stale. Orders whose payment reference was
+        deliberately unblocked are exempt.
         """
-        report = IndexReport()
+        report = IndexReport(scanned="full" if full else "active")
         by_canonical: dict[str, list[str]] = {}
 
-        cursor = self._orders.find({}, {"reference": 1, "reference_lower": 1})
+        query: dict = {"unblocked_at": {"$exists": False}}
+        if not full:
+            query["status"] = {"$nin": TERMINAL_STATUSES}
+        cursor = self._orders.find(query, {"reference": 1, "reference_lower": 1})
+        if not full:
+            cursor = cursor.hint("status_created")  # always walk the status index, never the collection
         async for doc in cursor:
             order_id = doc["_id"]
             try:
@@ -240,18 +270,34 @@ class Storage:
         report.stale_reference_lower.sort()
         return report
 
-    async def ensure_indexes(self) -> IndexReport:
-        """Create indexes. Never deletes or modifies orders.
-
-        The (user_id, created_at, _id) index is always created. The unique
-        reference index is created only when the audit finds no duplicate,
-        missing, stale or invalid reference data; otherwise the affected order
-        ids are logged and returned for a human to resolve.
-        """
-        await self._orders.create_index(
-            [("user_id", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
-            name=USER_ORDERS_INDEX,
+    def _log_reference_problems(self, report: IndexReport) -> None:
+        # Order ids and counts only: the duplicate map is keyed by payment references,
+        # so it is never logged.
+        duplicate_order_ids = sorted({oid for ids in report.duplicate_references.values() for oid in ids})
+        logging.error(
+            "Reference audit (%s scan) found problems; unique index NOT created. "
+            "index_blocked=%s duplicate_groups=%d duplicate_order_ids=%s missing_reference_lower=%s "
+            "stale_reference_lower=%s invalid_reference=%s",
+            report.scanned,
+            report.index_blocked,
+            len(report.duplicate_references),
+            duplicate_order_ids,
+            report.missing_reference_lower,
+            report.stale_reference_lower,
+            report.invalid_reference,
         )
+
+    async def ensure_indexes(self) -> IndexReport:
+        """Create the indexes. Never deletes or modifies orders.
+
+        Normal startup is cheap: the status/outbox/reservation/FSM indexes are created (a
+        no-op once they exist), the orders that can still change are audited through the
+        status index, and the unique reference index is created (a no-op once it exists).
+        Only if building that unique index fails because of existing duplicates is the whole
+        collection scanned, once, to name the offending order ids for a human to resolve.
+        """
+        for name, keys, options in ORDER_INDEXES:
+            await self._orders.create_index(keys, name=name, **options)
         await self.fsm_collection.create_index(
             "updated_at", expireAfterSeconds=FSM_TTL_SECONDS, name="fsm_ttl"
         )  # abandoned flows are cleaned up after a week
@@ -259,39 +305,27 @@ class Storage:
         await reservations.create_index("expires_at", expireAfterSeconds=0, name="reservation_ttl")
         await reservations.create_index("token", name="reservation_token")
         await reservations.create_index("order_id", name="reservation_order")
-        # Small sparse indexes: only orders that owe an alert/notice are in them.
-        await self._orders.create_index(
-            [("alert_pending", ASCENDING), ("alert_next_at", ASCENDING)], name="alert_outbox", sparse=True
-        )
-        await self._orders.create_index(
-            [("notice_pending", ASCENDING), ("notice_next_at", ASCENDING)], name="notice_outbox", sparse=True
-        )
 
         report = await self.audit_references()
-        report.created.append(USER_ORDERS_INDEX)
-
+        report.created.extend(name for name, _, _ in ORDER_INDEXES)
         if report.has_problems:
-            # Order ids and counts only: the duplicate map is keyed by payment references,
-            # so it is never logged.
-            duplicate_order_ids = sorted({oid for ids in report.duplicate_references.values() for oid in ids})
-            logging.error(
-                "Reference audit found problems; unique index NOT created. "
-                "duplicate_groups=%d duplicate_order_ids=%s missing_reference_lower=%s "
-                "stale_reference_lower=%s invalid_reference=%s",
-                len(report.duplicate_references),
-                duplicate_order_ids,
-                report.missing_reference_lower,
-                report.stale_reference_lower,
-                report.invalid_reference,
-            )
+            self._log_reference_problems(report)
             return report
 
-        await self._orders.create_index(
-            "reference_lower",
-            unique=True,
-            name=REFERENCE_INDEX,
-            partialFilterExpression={"reference_lower": {"$type": "string"}},
-        )
+        try:
+            await self._orders.create_index(
+                "reference_lower",
+                unique=True,
+                name=REFERENCE_INDEX,
+                partialFilterExpression={"reference_lower": {"$type": "string"}},
+            )
+        except DuplicateKeyError:
+            # Existing finished orders already share a payment proof: find out which (slow path).
+            report = await self.audit_references(full=True)
+            report.index_blocked = True
+            report.created.extend(name for name, _, _ in ORDER_INDEXES)
+            self._log_reference_problems(report)
+            return report
         report.created.append(REFERENCE_INDEX)
         return report
 
