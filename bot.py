@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 
 import requests
 from aiohttp import web
@@ -25,6 +26,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
+from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
 from storage import Storage
 
 load_dotenv()
@@ -646,6 +648,7 @@ TEXTS = {
 SUPPORT_USERNAME = (os.getenv("SUPPORT_USERNAME") or "").lstrip("@")
 prefs: dict[str, str] = {}  # in-memory cache; MongoDB (via storage.py) is the durable copy
 storage: Storage | None = None
+credbox: CredentialBox | None = None  # encrypts credentials stored on orders
 
 
 def t(user_id: int, key: str) -> str:
@@ -696,6 +699,7 @@ CUSTOMER_STATUS = {
     "reconcile": "Processing",
     "delivered": "Delivered",
     "rejected": "Rejected",
+    "purchased_undelivered": "Processing",
     "delivery_failed": "Failed",
 }
 MY_ORDERS_LIMIT = 5
@@ -725,6 +729,18 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
 
 # ---- Orders ---------------------------------------------------------------
 
+def order_credentials(order: dict) -> list[str]:
+    """The order's credentials, decrypted. Legacy plaintext orders are still readable."""
+    token = order.get("credentials_enc")
+    if token:
+        try:
+            return credbox.decrypt_list(token)
+        except CredentialDecryptError:
+            logging.error("Order %s: stored credentials could not be decrypted", order.get("id"))
+            return []
+    return list(order.get("credentials") or [])
+
+
 async def render_orders(user_id: int) -> str:
     try:
         mine = await storage.recent_orders(user_id, MY_ORDERS_LIMIT)  # newest first
@@ -738,8 +754,12 @@ async def render_orders(user_id: int) -> str:
     for order in mine:
         status = CUSTOMER_STATUS.get(order["status"], "Failed")
         block = f"📦 {order['name']}\nAmount: {order['price']:.2f} USDT\nStatus: {status}"
-        if order["status"] == "delivered" and order.get("credentials"):
-            block += "\nYour details:\n" + "\n".join(order["credentials"])
+        if order["status"] == "delivered":
+            credentials = order_credentials(order)
+            if credentials:
+                block += "\nYour details:\n" + "\n".join(credentials)
+            elif order.get("credentials_enc"):
+                block += "\nYour details could not be displayed right now. Please contact support."
         blocks.append(block)
     return ("Your recent orders:\n\n" + "\n\n".join(blocks))[:4096]
 
@@ -1250,18 +1270,20 @@ async def approve_order(callback: CallbackQuery):
 
         phase = "post"
         # The purchase is done: whatever happens below, the credentials must not be lost.
-        delivered_fields = {
-            "status": "delivered",
+        # They are stored (encrypted) on the order BEFORE any delivery is attempted.
+        purchased_fields = {
+            "status": "purchased_undelivered",
             "outcome": "purchased",
             "supplier": offer.supplier,
             "actual_cost": offer.cost,
-            "credentials": credentials,  # kept so "My Orders" can show them later
+            "credentials_enc": credbox.encrypt_list(credentials),
+            "purchased_at": datetime.now(timezone.utc),
         }
-        result = await persist_order(order_id, delivered_fields, "fulfilling", claim_token)
+        result = await persist_order(order_id, purchased_fields, "fulfilling", claim_token)
         if result == STALE:
             # Something else moved the order mid-purchase (e.g. a restart recovered it to
             # reconcile). Complete it only from reconcile; never overwrite a newer status.
-            result = await persist_order(order_id, delivered_fields, "reconcile", claim_token)
+            result = await persist_order(order_id, purchased_fields, "reconcile", claim_token)
         saved = result == SAVED
         stale = result == STALE
         marked = False
@@ -1277,20 +1299,21 @@ async def approve_order(callback: CallbackQuery):
                 == SAVED
             )
 
-        delivered = True
-        try:
-            await bot.send_message(
-                order["user_id"], (f"🎉 Your order: {order['name']}\n\n" + "\n".join(credentials))[:4096]
-            )
-        except Exception:
-            delivered = False
-            logging.error("Could not deliver order %s to user %s", order_id, order["user_id"])
+        delivered = await deliver_credentials(bot, order, credentials)
 
         status_update_failed = False
-        if not delivered and saved:
-            status_update_failed = await persist_order(order_id, {"status": "delivery_failed"}, "delivered", claim_token) != SAVED
+        if saved and delivered:
+            status_update_failed = (
+                await persist_order(
+                    order_id,
+                    {"status": "delivered", "delivered_at": datetime.now(timezone.utc)},
+                    "purchased_undelivered",
+                    claim_token,
+                )
+                != SAVED
+            )
 
-        if not saved or not delivered:
+        if not saved or not delivered or status_update_failed:
             problems = []
             if stale:
                 problems.append(
@@ -1311,10 +1334,19 @@ async def approve_order(callback: CallbackQuery):
                 )
             if not saved and delivered:
                 problems.append("The credentials were sent to the customer.")
-            if not delivered:
+            if not delivered and saved:
+                problems.append(
+                    "Delivery to the customer failed. The credentials are stored (encrypted) on the order, "
+                    "now 'purchased_undelivered', and the bot retries delivery automatically. If the "
+                    "customer has blocked the bot, forward the credentials below manually."
+                )
+            elif not delivered:
                 problems.append("Delivery to the customer failed; forward the credentials manually.")
             if status_update_failed:
-                problems.append("Its status could not be updated to delivery_failed; check the order state.")
+                problems.append(
+                    "The credentials reached the customer but the order could not be marked delivered; "
+                    "the bot may send them again."
+                )
             sent = await alert_admin(
                 bot,
                 f"🚨 Order #{order_id} was purchased but needs attention.\n"
@@ -1328,7 +1360,7 @@ async def approve_order(callback: CallbackQuery):
             )
             if not sent:
                 # Never treated as resolved: the order stays blocked (reconcile/purchased or
-                # delivery_failed) and is flagged in the log and on the admin's approval message.
+                # purchased_undelivered) and is flagged in the log and on the admin's approval message.
                 await flag_unalerted_purchase(callback, order)
             return
 
@@ -1640,6 +1672,60 @@ def new_order_alert(order: dict, delayed: bool = False) -> str:
 
 
 NOTIFY_RETRY_SECONDS = 60
+UNDELIVERED_MIN_AGE_SECONDS = 120  # let the approving handler finish its own delivery first
+MAX_AUTO_DELIVERY_ATTEMPTS = 5
+
+
+async def deliver_credentials(bot: Bot, order: dict, credentials: list[str]) -> bool:
+    """Send the purchased credentials to the customer. True only if Telegram accepted it."""
+    text = (f"🎉 Your order: {order['name']}\n\n" + "\n".join(credentials))[:4096]
+    try:
+        await bot.send_message(order["user_id"], text)
+        return True
+    except Exception as exc:
+        logging.error(
+            "Could not deliver order %s to user %s (%s)", order["id"], order["user_id"], type(exc).__name__
+        )
+        return False
+
+
+async def redeliver_undelivered(bot: Bot) -> None:
+    """Recovery path for `purchased_undelivered` orders: their credentials are already
+    stored (encrypted), so just retry delivery. Repeated deliveries are possible after a
+    crash between sending and marking delivered; losing the credentials is not."""
+    try:
+        due = await storage.undelivered_orders(UNDELIVERED_MIN_AGE_SECONDS, MAX_AUTO_DELIVERY_ATTEMPTS)
+    except PyMongoError as exc:
+        log_db_error("loading undelivered orders", exc)
+        return
+    for order in due:
+        try:
+            credentials = credbox.decrypt_list(order["credentials_enc"])
+        except (CredentialDecryptError, KeyError):
+            logging.error("Order %s: undelivered credentials could not be decrypted", order["id"])
+            continue
+        if await deliver_credentials(bot, order, credentials):
+            try:
+                await storage.mark_delivered(order["id"])
+            except PyMongoError as exc:
+                log_db_error("marking order delivered", exc, order=order["id"])
+            continue
+        try:
+            attempts = await storage.record_delivery_failure(order["id"])
+        except PyMongoError as exc:
+            log_db_error("recording delivery failure", exc, order=order["id"])
+            continue
+        if attempts >= MAX_AUTO_DELIVERY_ATTEMPTS:
+            await alert_admin(
+                bot,
+                f"🚨 Order #{order['id']}: automatic delivery failed {attempts} times and has stopped. "
+                f"The customer may have blocked the bot.\nUser: {order['user_label']}\n"
+                "Forward the credentials manually (the order stays purchased_undelivered):\n\n"
+                + "\n".join(credentials),
+                protect_content=True,
+                attempts=5,
+                order_id=order["id"],
+            )
 
 
 async def notify_pending_orders(bot: Bot) -> None:
@@ -1667,10 +1753,11 @@ async def notify_pending_orders(bot: Bot) -> None:
 
 async def notification_retry_loop(bot: Bot) -> None:
     while True:
-        try:
-            await notify_pending_orders(bot)
-        except Exception as exc:  # never let the loop die
-            logging.error("Notification retry pass failed (%s)", type(exc).__name__)
+        for background_pass in (notify_pending_orders, redeliver_undelivered):
+            try:
+                await background_pass(bot)
+            except Exception as exc:  # never let the loop die
+                logging.error("Background pass %s failed (%s)", background_pass.__name__, type(exc).__name__)
         await asyncio.sleep(NOTIFY_RETRY_SECONDS)
 
 
@@ -1702,7 +1789,11 @@ async def main():
     if not ADMIN_CHAT_ID:
         raise SystemExit("ADMIN_CHAT_ID environment variable is not set.")
 
-    global storage
+    global storage, credbox
+    try:
+        credbox = CredentialBox.from_env()
+    except CredentialKeyError as exc:
+        raise SystemExit(f"{exc}. Generate one with the command in .env.example.")
     try:
         storage = Storage.from_env()
     except RuntimeError as exc:

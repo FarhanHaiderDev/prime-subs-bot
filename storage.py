@@ -9,7 +9,7 @@ import os
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
 
@@ -413,6 +413,48 @@ class Storage:
         result = await self._orders.update_one(
             {"_id": order_id, "admin_notified": False},
             {"$set": {"admin_notified": True, "admin_notified_at": datetime.now(timezone.utc)}},
+        )
+        return result.matched_count == 1
+
+    async def undelivered_orders(
+        self, min_age_seconds: int, max_attempts: int, limit: int = 20
+    ) -> list[dict]:
+        """Orders whose purchase is stored but whose credentials have not reached the
+        customer: status `purchased_undelivered`, purchased at least `min_age_seconds` ago
+        (so the approving handler can finish its own delivery first) and with fewer than
+        `max_attempts` automatic redelivery failures."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)
+        cursor = (
+            self._orders.find(
+                {
+                    "status": "purchased_undelivered",
+                    "purchased_at": {"$lte": cutoff},
+                    "$or": [
+                        {"delivery_attempts": {"$exists": False}},
+                        {"delivery_attempts": {"$lt": max_attempts}},
+                    ],
+                }
+            )
+            .sort("_id", ASCENDING)
+            .limit(limit)
+        )
+        return await cursor.to_list(length=limit)
+
+    async def record_delivery_failure(self, order_id: str) -> int:
+        """Count one failed automatic redelivery. Returns the new count (0 if the order is
+        no longer purchased_undelivered)."""
+        order = await self._orders.find_one_and_update(
+            {"_id": order_id, "status": "purchased_undelivered"},
+            {"$inc": {"delivery_attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        return int(order.get("delivery_attempts", 0)) if order else 0
+
+    async def mark_delivered(self, order_id: str) -> bool:
+        """purchased_undelivered -> delivered, only while it is still purchased_undelivered."""
+        result = await self._orders.update_one(
+            {"_id": order_id, "status": "purchased_undelivered"},
+            {"$set": {"status": "delivered", "delivered_at": datetime.now(timezone.utc)}},
         )
         return result.matched_count == 1
 

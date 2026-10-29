@@ -3,3 +3,4 @@ aiohttp==3.10.11
 requests==2.31.0
 python-dotenv==1.0.1
 pymongo==4.19.0
+cryptography==46.0.7

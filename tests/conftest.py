@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from cryptography.fernet import Fernet
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -38,12 +39,20 @@ for _name in ("SUPPLIER_API_KEY", "CANBOSO_ENABLED", "MONGODB_URI", "ENCRYPTION_
     os.environ.pop(_name, None)
 
 import bot  # noqa: E402
+from credbox import CredentialBox  # noqa: E402
 from mongomock_motor import AsyncMongoMockClient  # noqa: E402
 from storage import Storage  # noqa: E402
 
 ADMIN_ID = 111
 CUSTOMER_ID = 777
 TXID = "ab" * 32  # a well-formed 64-hex proof
+
+
+@pytest.fixture(autouse=True)
+def credential_box(monkeypatch):
+    box = CredentialBox(Fernet.generate_key().decode())
+    monkeypatch.setattr(bot, "credbox", box)
+    return box
 
 
 @pytest.fixture
@@ -56,12 +65,24 @@ async def storage(monkeypatch):
 
 
 class FakeBot:
-    """Records every Telegram message the code sends."""
+    """Records every Telegram message the code sends.
 
-    def __init__(self):
+    fail_for: chat ids whose sends raise (e.g. a customer who blocked the bot).
+    on_send: optional async hook called with (chat_id, text) before each send.
+    """
+
+    def __init__(self, fail_for=(), on_send=None):
         self.sent = []
+        self.attempts = {}
+        self.fail_for = {str(c) for c in fail_for}
+        self.on_send = on_send
 
     async def send_message(self, chat_id, text, **kwargs):
+        self.attempts[str(chat_id)] = self.attempts.get(str(chat_id), 0) + 1
+        if self.on_send:
+            await self.on_send(chat_id, text)
+        if str(chat_id) in self.fail_for:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
         self.sent.append((chat_id, text, kwargs))
 
     def texts_to(self, chat_id):
