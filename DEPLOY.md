@@ -19,7 +19,7 @@ store). Names only; values are never documented or committed. Copy `.env.example
 | Name | Required | Purpose |
 |---|---|---|
 | `BOT_TOKEN` | yes | Telegram bot token |
-| `ADMIN_CHAT_ID` | yes | Telegram **user** id of the admin (approves orders). Not a group id |
+| `ADMIN_CHAT_ID` | yes | Telegram **user** id of the admin (approves orders): a positive whole number. A group id, `@username`, `0` or anything else is rejected at startup |
 | `SUPPLIER_2_API_KEY` | yes | Pandora Digital API key (the live supplier) |
 | `MONGODB_URI` | yes | MongoDB connection string |
 | `MONGODB_DB` | no (default `prime_subs_bot`) | Database name |

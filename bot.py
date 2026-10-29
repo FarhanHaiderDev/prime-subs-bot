@@ -601,6 +601,39 @@ async def flag_unalerted_purchase(callback: CallbackQuery, order: dict) -> None:
         logging.error("Could not mark the admin message for order %s (%s)", order["id"], type(exc).__name__)
 
 
+ADMIN_ID_RE = re.compile(r"[1-9][0-9]{0,15}")
+
+
+def validate_admin_chat_id(value) -> str:
+    """ADMIN_CHAT_ID must be the admin's numeric Telegram USER id: a positive whole number.
+
+    Admin buttons compare the clicking user's id with it, so a group/channel id (negative),
+    a @username, a zero or a malformed value would silently lock the admin out. Raises
+    ValueError with a message that says what to fix, without echoing the value."""
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise ValueError(
+            "ADMIN_CHAT_ID is not set. Set it to your numeric Telegram user id (ask @userinfobot)."
+        )
+    if ADMIN_ID_RE.fullmatch(text):
+        return text
+    if text.startswith("-"):
+        hint = "that looks like a group or channel id; only a personal user id (a positive number) can approve orders"
+    elif text.startswith("@") or not any(ch.isdigit() for ch in text):
+        hint = "usernames are not accepted; use the numeric user id"
+    elif text.lstrip("+").startswith("0") or text.startswith("+"):
+        hint = "write the number without a sign or leading zeros"
+    else:
+        hint = "it must contain digits only"
+    raise ValueError(f"ADMIN_CHAT_ID is invalid: {hint}.")
+
+
+def apply_admin_chat_id() -> None:
+    """Validate the configured admin id once at startup and store its normalised form."""
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = validate_admin_chat_id(ADMIN_CHAT_ID)
+
+
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_CHAT_ID) and str(user_id) == str(ADMIN_CHAT_ID)
 
@@ -1905,8 +1938,10 @@ async def main():
         )
     if not (supplier_is_live("pandora") or supplier_is_live("canboso")):
         raise SystemExit("No live supplier: set SUPPLIER_2_API_KEY (Pandora).")
-    if not ADMIN_CHAT_ID:
-        raise SystemExit("ADMIN_CHAT_ID environment variable is not set.")
+    try:
+        apply_admin_chat_id()
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     global storage, credbox
     try:
