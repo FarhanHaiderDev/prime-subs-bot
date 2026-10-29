@@ -6,6 +6,29 @@ Legend: **VERIFIED** = confirmed by reading code or running a local check. **ASS
 
 ---
 
+---
+
+## PHASE 0 / PHASE 1 STATUS UPDATE (branch `fix/phase1`)
+
+The sections below describe the tree **as audited** (commit `00371eb`); the file/line references in them have since shifted. This section records what the `fix/phase1` branch changed. Everything was verified offline only: 47 pytest tests (in-memory MongoDB, fake Pandora, fake Telegram), a clean install in a brand-new venv (`pip install -r requirements-dev.txt`, `pip check` clean), and a startup check with dummy values against an unreachable local MongoDB. Nothing was run against real MongoDB, Telegram or either seller.
+
+| Commit | Change |
+|---|---|
+| Phase 0 | All dependencies exact-pinned (incl. `pymongo==4.19.0`); `requirements-dev.txt` for the tests. `.env.example` already carried the `MONGODB_URI` placeholder. |
+| Fix 1 | Suppliers count only if live. `CANBOSO_ENABLED` (default off) AND `CANBOSO_PURCHASE_IMPLEMENTED` (False in code) gate Canboso; catalog, pricing and fulfilment ignore it, and startup refuses `CANBOSO_ENABLED=true` while the purchase is a stub. |
+| Fix 2 | Every post-claim write filters on status AND `claim_token` (`persist_order` requires the token; `claim_token` cannot be overwritten through fields). |
+| Fix 3 | Credentials are encrypted (`ENCRYPTION_KEY`, Fernet, comma-separated keys for rotation) and stored on the order with status `purchased_undelivered` BEFORE delivery; only then sent, then `delivered`. Failed deliveries stay `purchased_undelivered`; a background pass redelivers (min age 120 s, 5 attempts, then an admin alert with the credentials). |
+| Fix 4 | The unique index on the canonical payment proof already existed, but `0x<txid>` and `<txid>` were treated as different (reproduced). The canonical form now drops the `0x` prefix; the duplicate message is explicit; a duplicate-key race is handled the same way. |
+| Fix 5 | The admin approval message has an EXPECTED PAYMENT block (amount, coin/network, the address/ID the customer was told to pay, snapshotted as `pay_to`) next to the SUBMITTED PROOF. |
+
+**New or changed environment variables (names only):** `ENCRYPTION_KEY` (required), `CANBOSO_ENABLED` (optional, keep `false`), and `MONGODB_URI` is required as before. **New order statuses/fields:** status `purchased_undelivered`; fields `credentials_enc`, `purchased_at`, `delivered_at`, `delivery_attempts`, `pay_to`.
+
+**Resolution of the 27 problems in section 9:** 2 resolved (#1, #5), 7 partially resolved (#2, #4, #6, #7, #9, #22, #23), 1 mitigated but still open (#3), 17 open. Each item in section 9 below carries its status tag.
+
+**Known limits of this verification:** the new `ENCRYPTION_KEY`/`MONGODB_URI` values must be added to your real `.env` by you; the in-memory MongoDB used by the tests does not implement aggregation-pipeline updates, so startup recovery (`recover_interrupted_orders`) is not covered by the tests; Pandora and Canboso behaviour is still unverified against the real APIs.
+
+---
+
 ## 1. OVERVIEW
 
 **Language / framework**
@@ -125,7 +148,7 @@ Legend: **VERIFIED** = confirmed by reading code or running a local check. **ASS
 
 **Rate limiting / spam protection**: NOT PRESENT (no throttling or middleware, VERIFIED by search).
 
-**Other**: credentials are stored in plaintext in MongoDB (1225-1231) so "My Orders" can show them. Payment references are no longer written to logs (the audit log was fixed; every log call uses order ids / error types).
+**Other**: *(UPDATED on fix/phase1: credentials are now stored Fernet-encrypted in `credentials_enc`, key from `ENCRYPTION_KEY`.)* At audit time credentials were stored in plaintext in MongoDB (1225-1231) so "My Orders" can show them. Payment references are no longer written to logs (the audit log was fixed; every log call uses order ids / error types).
 
 ---
 
@@ -151,7 +174,7 @@ Legend: **VERIFIED** = confirmed by reading code or running a local check. **ASS
 
   The local `.env` has `BOT_TOKEN`, `SUPPLIER_API_KEY`, `SUPPLIER_2_API_KEY`, `MARKUP_PERCENT`, `MARKUP_FIXED`, `ADMIN_CHAT_ID`, `BINANCE_PAY_ID`, `BEP20_ADDRESS`, `TRC20_ADDRESS`, `SUPPORT_USERNAME` set (all non-empty) and **no `MONGODB_URI` / `MONGODB_DB`**.
 - **Deployment files**: Dockerfile, Procfile, `render.yaml`, systemd unit, CI config - all NOT PRESENT. The only host hint is the health server comment mentioning Render (bot.py:1647). No start command or persistent-disk requirement is documented.
-- **Tests**: NOT PRESENT (no test files, no pytest/tox config). No linter or type-checker is installed in the venv.
+- **Tests**: *(UPDATED on fix/phase1: 47 offline tests in `tests/`, run with pytest; see the status section.)* At audit time: NOT PRESENT (no test files, no pytest/tox config). No linter or type-checker is installed in the venv.
 
 ---
 
@@ -162,7 +185,7 @@ Legend: **VERIFIED** = confirmed by reading code or running a local check. **ASS
 3. Copy `.env.example` to `.env` and fill in real values, including `MONGODB_URI`.
 4. `python bot.py`.
 
-**Does it run right now? No** (VERIFIED, safe check: `import bot` with the project venv and no secrets):
+**Does it run right now? At audit time: No.** *(UPDATED on fix/phase1: dependencies are pinned and a fresh venv installs; the bot still needs `MONGODB_URI` and `ENCRYPTION_KEY` in `.env`.)* (VERIFIED, safe check: `import bot` with the project venv and no secrets):
 - `ModuleNotFoundError: No module named 'pymongo'` at bot.py:26.
 - Even after installing it, `.env` has no `MONGODB_URI`, so `main()` would exit with "MONGODB_URI environment variable is not set." (storage.py:112, bot.py:1674).
 
@@ -173,39 +196,39 @@ Legend: **VERIFIED** = confirmed by reading code or running a local check. **ASS
 ## 9. PROBLEMS FOUND
 
 **CRITICAL**
-1. **Products where Canboso is the cheapest source can never be fulfilled, but are sold at the Canboso-based price.** `purchase_canboso` always fails (272-274); the price is derived from the cheapest offer (264, `Listing.cost` 128-130); the Pandora fallback refuses to buy when its price exceeds the ceiling computed from that price (381, 303). Failure path: customer pays -> admin approves -> Canboso stub fails -> Pandora is dearer than the ceiling -> order is `held`; Retry fails identically. (VERIFIED by code; ASSUMPTION that Pandora's cost exceeds Canboso's for those products.)
+1. **[RESOLVED (Fix 1)]** **Products where Canboso is the cheapest source can never be fulfilled, but are sold at the Canboso-based price.** `purchase_canboso` always fails (272-274); the price is derived from the cheapest offer (264, `Listing.cost` 128-130); the Pandora fallback refuses to buy when its price exceeds the ceiling computed from that price (381, 303). Failure path: customer pays -> admin approves -> Canboso stub fails -> Pandora is dearer than the ceiling -> order is `held`; Retry fails identically. (VERIFIED by code; ASSUMPTION that Pandora's cost exceeds Canboso's for those products.)
 
 **HIGH**
-2. The bot does not start in the current environment: `pymongo` missing (bot.py:26) and no `MONGODB_URI` in `.env` (storage.py:112).
-3. Payments are not verified by the bot: any well-formed reference is accepted (69-70, 1049-1075); amount, destination and sender are never checked; safety depends entirely on the admin's manual check.
-4. Credentials can be lost if a purchase succeeds while MongoDB, Telegram and customer delivery all fail (1224-1262, 1274-1278). Credentials then exist only in memory/the alert; recovery would be from the supplier by client reference (retention undocumented).
-5. Post-claim writes are conditional on status only, not on the claim token (1232, 1236, 1360, 1385; storage.py:248-280). A late handler from an older attempt/instance can write onto a newer attempt's `fulfilling` order.
-6. Overlapping instances / unlock-and-Retry can cause a second purchase: startup recovery flips every `fulfilling` order (storage.py:356-388), the fence only blocks *new* requests, and unlock relies on the admin's Pandora confirmation (1445-1567; storage.py:324-354). Safety depends on that human confirmation.
+2. **[PARTIALLY RESOLVED (Phase 0: deps pinned, fresh install verified; your .env still needs MONGODB_URI and the new ENCRYPTION_KEY)]** The bot does not start in the current environment: `pymongo` missing (bot.py:26) and no `MONGODB_URI` in `.env` (storage.py:112).
+3. **[MITIGATED, STILL OPEN (Fix 4+5: one proof backs one order incl. the 0x bypass; admin sees amount/network/proof; still no automated on-chain/Binance verification)]** Payments are not verified by the bot: any well-formed reference is accepted (69-70, 1049-1075); amount, destination and sender are never checked; safety depends entirely on the admin's manual check.
+4. **[PARTIALLY RESOLVED (Fix 3: credentials are stored encrypted BEFORE delivery; remaining: database + Telegram + customer delivery all failing at purchase time)]** Credentials can be lost if a purchase succeeds while MongoDB, Telegram and customer delivery all fail (1224-1262, 1274-1278). Credentials then exist only in memory/the alert; recovery would be from the supplier by client reference (retention undocumented).
+5. **[RESOLVED (Fix 2)]** Post-claim writes are conditional on status only, not on the claim token (1232, 1236, 1360, 1385; storage.py:248-280). A late handler from an older attempt/instance can write onto a newer attempt's `fulfilling` order.
+6. **[PARTIALLY RESOLVED (Fix 2 stops stale writes; a duplicate purchase through overlap/unlock still depends on the admin's Pandora confirmation)]** Overlapping instances / unlock-and-Retry can cause a second purchase: startup recovery flips every `fulfilling` order (storage.py:356-388), the fence only blocks *new* requests, and unlock relies on the admin's Pandora confirmation (1445-1567; storage.py:324-354). Safety depends on that human confirmation.
 
 **MEDIUM**
-7. No backup/restore mechanism in the repo; orders and plaintext credentials (1225-1231) live only in MongoDB.
-8. Startup-recovery, hold and reconcile alerts are sent once and not retried if Telegram fails (1370-1378, 1382-1415, 1706-1722); recovered orders' customers are not notified.
-9. No refund/compensation path for held, rejected or failed orders (NOT PRESENT); `delivery_failed` shows the paying customer "Failed" (671, 713).
-10. Stock race: no reservation; the last unit can be sold twice and the second order is held after payment (204-207, 976, 1003).
-11. Price drift between payment and approval makes the cost-ceiling check fail and the order hold (303, 381); there is no repricing.
-12. No rate limiting; each tap can trigger supplier catalog fetches (254-261, 976, 1003) and database reads.
-13. Seller behaviour is unverified: Pandora idempotency and error-code classification (342) rely on documentation not in the repo; Canboso response shapes are guessed (137-174).
-14. No global error handler; some user-facing failures are silent (e.g. a `TypeError` from a bad supplier payload escapes `build_catalog`, 234).
+7. **[PARTIALLY RESOLVED (Fix 3: credentials encrypted at rest; backups still NOT PRESENT)]** No backup/restore mechanism in the repo; orders and plaintext credentials (1225-1231) live only in MongoDB.
+8. **[OPEN]** Startup-recovery, hold and reconcile alerts are sent once and not retried if Telegram fails (1370-1378, 1382-1415, 1706-1722); recovered orders' customers are not notified.
+9. **[PARTIALLY RESOLVED (Fix 3: a paid-but-undelivered order shows Processing and is redelivered automatically; refunds/compensation still NOT PRESENT)]** No refund/compensation path for held, rejected or failed orders (NOT PRESENT); `delivery_failed` shows the paying customer "Failed" (671, 713).
+10. **[OPEN]** Stock race: no reservation; the last unit can be sold twice and the second order is held after payment (204-207, 976, 1003).
+11. **[OPEN]** Price drift between payment and approval makes the cost-ceiling check fail and the order hold (303, 381); there is no repricing.
+12. **[OPEN]** No rate limiting; each tap can trigger supplier catalog fetches (254-261, 976, 1003) and database reads.
+13. **[OPEN]** Seller behaviour is unverified: Pandora idempotency and error-code classification (342) rely on documentation not in the repo; Canboso response shapes are guessed (137-174).
+14. **[OPEN]** No global error handler; some user-facing failures are silent (e.g. a `TypeError` from a bad supplier payload escapes `build_catalog`, 234).
 
 **LOW**
-15. Duplicate new-order alert possible while the first alert is still in flight (1076 vs 1097; 1614-1643).
-16. A rejected order's reference stays blocked forever (storage.py:424).
-17. `Retry-After` parsed with `int()` raises on an HTTP-date header (332) - fails safe to `unknown`.
-18. Language-save failure logs a full traceback (800).
-19. Translations cover only the dashboard (576-617).
-20. FSM state lost on restart (78).
-21. Missing indexes for status-based scans (storage.py:356, 390); startup reference audit scans every order (storage.py:152-183).
-22. No Python version pin; `pymongo` has no exact pin (`requirements.txt`).
-23. Deployment files, CI and tests absent; health server is unauthenticated on `0.0.0.0` (1646-1660).
-24. `Bot` session is not closed on `SystemExit` paths (1685-1705) - cosmetic.
-25. `.vscode/settings.json` is tracked; `.gitignore` still lists `orders.json` / `prefs.json`.
-26. Admin id must be a user id, not a group id (552-553).
-27. Telegram length limits are approximated in code points (475, 522, 716).
+15. **[OPEN]** Duplicate new-order alert possible while the first alert is still in flight (1076 vs 1097; 1614-1643).
+16. **[OPEN (message is clearer; behaviour unchanged)]** A rejected order's reference stays blocked forever (storage.py:424).
+17. **[OPEN]** `Retry-After` parsed with `int()` raises on an HTTP-date header (332) - fails safe to `unknown`.
+18. **[OPEN]** Language-save failure logs a full traceback (800).
+19. **[OPEN]** Translations cover only the dashboard (576-617).
+20. **[OPEN]** FSM state lost on restart (78).
+21. **[OPEN]** Missing indexes for status-based scans (storage.py:356, 390); startup reference audit scans every order (storage.py:152-183).
+22. **[PARTIALLY RESOLVED (every dependency is exact-pinned; the Python version is still unpinned)]** No Python version pin; `pymongo` has no exact pin (`requirements.txt`).
+23. **[PARTIALLY RESOLVED (47 offline tests + pytest config added; Dockerfile/Procfile/CI still absent; health server unchanged)]** Deployment files, CI and tests absent; health server is unauthenticated on `0.0.0.0` (1646-1660).
+24. **[OPEN]** `Bot` session is not closed on `SystemExit` paths (1685-1705) - cosmetic.
+25. **[OPEN (.vscode still tracked; stale JSON lines remain in .gitignore)]** `.vscode/settings.json` is tracked; `.gitignore` still lists `orders.json` / `prefs.json`.
+26. **[OPEN]** Admin id must be a user id, not a group id (552-553).
+27. **[OPEN]** Telegram length limits are approximated in code points (475, 522, 716).
 
 ---
 
