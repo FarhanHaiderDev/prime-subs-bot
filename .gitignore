@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 
-orders.json
-prefs.json
 .pytest_cache/
 backups/
+.vscode/
