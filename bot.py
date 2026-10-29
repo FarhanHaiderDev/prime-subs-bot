@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from credbox import CredentialBox, CredentialDecryptError, CredentialKeyError
+from fsmstorage import MongoFSMStorage
 from logsetup import configure_logging, order_context, set_order_id
 from ratelimit import RateLimitMiddleware, SlidingWindowLimiter, wait_text
 from storage import (
@@ -2217,6 +2218,12 @@ ERROR_ALERT_INTERVAL = 60  # seconds between admin alerts for the same kind of e
 _last_error_alert: dict[str, float] = {}
 
 
+def install_fsm_storage(db_storage: Storage) -> None:
+    """Keep conversation state (checkout, search, unlock flows) in MongoDB instead of memory,
+    so it survives a restart."""
+    dp.fsm.storage = MongoFSMStorage(db_storage.fsm_collection)
+
+
 def update_kind(update) -> str:
     for kind in ("message", "callback_query"):
         if getattr(update, kind, None) is not None:
@@ -2299,6 +2306,7 @@ async def main():
         await storage.connect()
         report = await storage.ensure_indexes()
         prefs.update(await storage.all_langs())
+        install_fsm_storage(storage)
     except PyMongoError as exc:
         await storage.close()
         # Log the exception type only; driver messages can echo connection details.

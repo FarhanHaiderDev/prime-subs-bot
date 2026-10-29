@@ -46,6 +46,8 @@ ALERT_BACKOFF_BASE_SECONDS = 60
 ALERT_BACKOFF_MAX_SECONDS = 3600
 MAX_NOTICE_ATTEMPTS = 8  # a customer who blocked the bot is given up on; the admin alert never is
 
+FSM_TTL_SECONDS = 7 * 24 * 3600
+
 # Stock reservations: a scarce unit is held for a buyer while they pay. Each unit of a
 # product is a "slot" document whose _id is "<product key>#<n>"; claiming a slot is an atomic
 # insert (or an atomic takeover of an expired slot), so two buyers can never share one unit.
@@ -198,6 +200,11 @@ class Storage:
     def _prefs(self):
         return self._db["prefs"]
 
+    @property
+    def fsm_collection(self):
+        """Where the bot's conversation state (checkout, search, unlock flows) is kept."""
+        return self._db["fsm"]
+
     # ---- Indexes (separate from connect so callers decide when to run it) ----
 
     async def audit_references(self) -> IndexReport:
@@ -245,6 +252,9 @@ class Storage:
             [("user_id", ASCENDING), ("created_at", DESCENDING), ("_id", DESCENDING)],
             name=USER_ORDERS_INDEX,
         )
+        await self.fsm_collection.create_index(
+            "updated_at", expireAfterSeconds=FSM_TTL_SECONDS, name="fsm_ttl"
+        )  # abandoned flows are cleaned up after a week
         reservations = self._db["reservations"]
         await reservations.create_index("expires_at", expireAfterSeconds=0, name="reservation_ttl")
         await reservations.create_index("token", name="reservation_token")
