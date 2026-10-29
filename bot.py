@@ -57,18 +57,24 @@ MARKUP_FIXED = float(os.getenv("MARKUP_FIXED", "0"))
 PAYMENT_METHODS = {
     "binance": {
         "label": "Binance Pay (ID/Email)",
+        "coin": "USDT",
+        "network": "Binance Pay (internal transfer, no blockchain network)",
         "destination": os.getenv("BINANCE_PAY_ID"),
         "dest_label": "Binance Pay ID / Email",
         "ref_label": "Binance Order ID",
     },
     "bep20": {
         "label": "BEP20 (USDT)",
+        "coin": "USDT",
+        "network": "BEP20 (BNB Smart Chain)",
         "destination": os.getenv("BEP20_ADDRESS"),
         "dest_label": "BEP20 (BNB Smart Chain) USDT address",
         "ref_label": "transaction hash (TXID)",
     },
     "trc20": {
         "label": "TRC20 (USDT)",
+        "coin": "USDT",
+        "network": "TRC20 (TRON)",
         "destination": os.getenv("TRC20_ADDRESS"),
         "dest_label": "TRC20 (TRON) USDT address",
         "ref_label": "transaction hash (TXID)",
@@ -1123,6 +1129,7 @@ async def receive_reference(message: Message, state: FSMContext):
         "price": data["price"],
         "method": data["method"],
         "reference": reference,
+        "pay_to": method["destination"],  # snapshot of where the customer was told to pay
         "offers": data["offers"],
         "admin_notified": False,  # durable outbox marker: set True only once Telegram confirms the alert
     }
@@ -1660,19 +1667,29 @@ async def unlock_cancel(callback: CallbackQuery, state: FSMContext):
 
 
 def new_order_alert(order: dict, delayed: bool = False) -> str:
-    """The new-order alert for the admin (the payment reference is needed to verify it;
-    it is never logged). Contains no credentials."""
+    """The new-order alert the admin approves from. It states what payment to expect
+    (amount, coin/network, destination) next to the proof the customer submitted, so the
+    payment can be checked before tapping Approve. The proof is needed here and is never
+    logged. Contains no credentials."""
     method = PAYMENT_METHODS.get(order["method"], {})
+    coin = method.get("coin", "USDT")
+    network = method.get("network", order["method"])
+    proof_label = method.get("ref_label", "payment proof")
     best = order["offers"][0]
     fallback = f" (fallback: {order['offers'][1]['supplier']})" if len(order["offers"]) > 1 else ""
     return (
         ("🔔 Delayed notification (the first alert may not have arrived)\n" if delayed else "")
         + f"New order to verify (#{order['id']})\n"
         f"User: {order['user_label']}\n"
-        f"Product: {order['name']}\n"
-        f"Amount: {order['price']:.2f} USDT\n"
-        f"Method: {method.get('label', order['method'])}\n"
-        f"Reference ({method.get('ref_label', 'reference')}): {order['reference']}\n"
+        f"Product: {order['name']}\n\n"
+        "EXPECTED PAYMENT\n"
+        f"Amount: {order['price']:.2f} {coin}\n"
+        f"Coin / network: {coin} on {network}\n"
+        f"Paid to: {order.get('pay_to') or '(not recorded)'}\n\n"
+        "SUBMITTED PROOF\n"
+        f"{proof_label}: {order['reference']}\n\n"
+        f"Check that exactly {order['price']:.2f} {coin} arrived on {network} at the address above, "
+        "and that this proof is that payment, before you tap Approve.\n"
         f"Source: {best['supplier']} at cost {best['cost']:.2f}{fallback}"
     )
 
