@@ -654,6 +654,43 @@ class Storage:
         result = await self._db["reservations"].delete_many(query)
         return result.deleted_count
 
+    async def claim_price_review(self, order_id: str) -> dict | None:
+        """The admin approved buying at the new cost: price_review -> fulfilling under a fresh
+        claim token, with the purchase ceiling raised to that cost. Atomic; None if the order
+        is not (or no longer) awaiting this decision."""
+        order = await self._orders.find_one({"_id": order_id, "status": "price_review"})
+        if order is None or "price_review" not in order:
+            return None
+        new_cost = order["price_review"]["new_cost"]
+        return await self._orders.find_one_and_update(
+            {"_id": order_id, "status": "price_review", "price_review.new_cost": new_cost},
+            {
+                "$set": {
+                    "status": "fulfilling",
+                    "claim_token": uuid.uuid4().hex,
+                    "approved_cost": new_cost,
+                    "price_review.decision": "approved",
+                    "alert_pending": False,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def hold_price_review(self, order_id: str) -> dict | None:
+        """The admin chose to hold instead: price_review -> held (Retry and Reject apply)."""
+        return await self._orders.find_one_and_update(
+            {"_id": order_id, "status": "price_review"},
+            {
+                "$set": {
+                    "status": "held",
+                    "error": "Held by the admin after a price change",
+                    "price_review.decision": "held",
+                    "alert_pending": False,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
     async def recent_orders(self, user_id: int, limit: int = 5) -> list[dict]:
         """A user's most recent orders, newest first.
 

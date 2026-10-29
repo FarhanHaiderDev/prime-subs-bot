@@ -6,7 +6,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 
 import requests
@@ -130,6 +130,17 @@ class SupplierError(Exception):
     """Proven failure: this supplier did NOT purchase anything, so trying the
     next one (or a normal Retry) is safe. Anything not provable is an
     AmbiguousOrderError instead."""
+
+
+class PriceChanged(SupplierError):
+    """The supplier's live cost is above what the order was priced on. Nothing was bought
+    (this is raised before any purchase request), and it must NOT fail the order: the admin
+    decides whether to buy at the new cost."""
+
+    def __init__(self, supplier: str, new_cost: float):
+        super().__init__(f"{supplier} cost is now {new_cost:.2f}, above the order's cost ceiling")
+        self.supplier = supplier
+        self.new_cost = new_cost
 
 
 class AmbiguousOrderError(Exception):
@@ -315,13 +326,14 @@ def retail_price(cost: float) -> float:
 # Fulfilment
 # --------------------------------------------------------------------------
 
-def purchase_canboso(offer: Offer, order_id: str, max_cost: float, fence) -> list[str]:
+def purchase_canboso(offer: Offer, order_id: str, max_cost: float, fence) -> tuple[list[str], float]:
     # Canboso's order-creation API isn't documented yet. Until it is implemented (and
     # CANBOSO_PURCHASE_IMPLEMENTED is set), Canboso is not live, so this is never reached.
     raise SupplierError("Canboso automatic purchase is not implemented")
 
 
-def purchase_pandora(offer: Offer, order_id: str, max_cost: float, fence) -> list[str]:
+def purchase_pandora(offer: Offer, order_id: str, max_cost: float, fence) -> tuple[list[str], float]:
+    """Returns (credentials, the unit price the supplier actually charged)."""
     if not SUPPLIER_2_API_KEY:
         raise SupplierError("SUPPLIER_2_API_KEY is not set")
 
@@ -348,7 +360,7 @@ def purchase_pandora(offer: Offer, order_id: str, max_cost: float, fence) -> lis
         raise SupplierError("Pandora quote: cannot purchase (out of stock or unavailable)")
     unit_price = quote["unit_price"]
     if float(unit_price) > max_cost:
-        raise SupplierError(f"Pandora price rose to {unit_price}, above the {max_cost:.2f} cost ceiling")
+        raise PriceChanged("pandora", float(unit_price))
 
     order_body = {
         **body,
@@ -411,7 +423,7 @@ def purchase_pandora(offer: Offer, order_id: str, max_cost: float, fence) -> lis
         items = (order.get("delivery") or {}).get("items") or []
         if not items:
             raise AmbiguousOrderError(f"Pandora order {order.get('id')} delivered with no items")
-        return [str(i) for i in items]
+        return [str(i) for i in items], float(unit_price)
     if order.get("status") == "failed":
         # The supplier itself reports a terminal failure for this order: nothing delivered.
         raise SupplierError(f"Pandora order failed: {order.get('failure_code')}")
@@ -426,6 +438,8 @@ def fulfil(order: dict, fence) -> tuple[list[str], Offer, list[str]]:
     failures = []
     # Never buy above the cost the customer's price was derived from (+1 cent rounding).
     max_cost = (order["price"] - MARKUP_FIXED) / (1 + MARKUP_PERCENT / 100) + 0.01
+    if order.get("approved_cost") is not None:  # the admin accepted buying at a higher cost
+        max_cost = max(max_cost, float(order["approved_cost"]) + 0.01)
     # A new attempt (after a definitive failure) needs a fresh idempotency key.
     purchase_ref = purchase_ref_for(order)
     # Only sources that are actually live are considered (an order stored with an offer
@@ -433,12 +447,19 @@ def fulfil(order: dict, fence) -> tuple[list[str], Offer, list[str]]:
     live_offers = [Offer(**raw) for raw in order["offers"] if supplier_is_live(raw["supplier"])]
     if not live_offers:
         raise SupplierError("no live supplier is available for this order")
+    price_change = None
     for offer in live_offers:
         try:
-            return PURCHASERS[offer.supplier](offer, purchase_ref, max_cost, fence), offer, failures
+            credentials, charged = PURCHASERS[offer.supplier](offer, purchase_ref, max_cost, fence)
+            return credentials, replace(offer, cost=charged), failures  # cost = what was really paid
+        except PriceChanged as exc:
+            price_change = price_change or exc  # try the other sources first
+            failures.append(f"{offer.supplier}: {exc}")
         except SupplierError as exc:
             failures.append(f"{offer.supplier}: {exc}")
             logging.warning("Order %s: %s failed: %s", order["id"], offer.supplier, exc)
+    if price_change is not None:
+        raise price_change  # no source could be used at the old price: the admin decides
     raise SupplierError("; ".join(failures) or "no offers")
 
 
@@ -763,6 +784,7 @@ CUSTOMER_STATUS = {
     "delivered": "Delivered",
     "rejected": "Rejected",
     "purchased_undelivered": "Processing",
+    "price_review": "Processing",
     "delivery_failed": "Failed",
 }
 MY_ORDERS_LIMIT = 5
@@ -1379,7 +1401,13 @@ async def approve_order(callback: CallbackQuery):
     if order is None:
         await callback.answer("This order can't be approved now.", show_alert=True)
         return
+    await process_claimed_order(callback, order)
 
+
+async def process_claimed_order(callback: CallbackQuery, order: dict) -> None:
+    """Everything after an order has been claimed (by Approve/Retry, or by approving a price
+    change): the purchase, persistence of the credentials, delivery, and every failure path."""
+    order_id = order["id"]
     bot = callback.bot
     phase = "pre"  # pre: no supplier call yet; buying: call in flight; post: purchase completed
 
@@ -1411,6 +1439,9 @@ async def approve_order(callback: CallbackQuery):
         phase = "buying"
         try:
             credentials, offer, failures = await asyncio.to_thread(fulfil, order, fence)
+        except PriceChanged as exc:
+            await request_price_decision(bot, order, exc)
+            return
         except SupplierError as exc:
             # Every SupplierError is a proven no-purchase failure, so a normal Retry stays available.
             await hold_order(bot, order, f"All suppliers failed: {exc}", attempt=order.get("attempt", 0) + 1)
@@ -1649,12 +1680,125 @@ async def reconcile_order(bot: Bot, order: dict, reason: str) -> None:
     await notify_delay(bot, order)
 
 
+async def request_price_decision(bot: Bot, order: dict, change: PriceChanged) -> None:
+    """The live cost is above the order's ceiling. Do not fail the order: park it for the
+    admin with the new cost, margin and difference (the alert is durable, see order_alert)."""
+    old_cost = next(
+        (float(o["cost"]) for o in order["offers"] if o["supplier"] == change.supplier),
+        float(order["offers"][0]["cost"]),
+    )
+    review = {
+        "supplier": change.supplier,
+        "old_cost": old_cost,
+        "new_cost": change.new_cost,
+        "detected_at": datetime.now(timezone.utc),
+    }
+    result = await persist_order(
+        order["id"],
+        {"status": "price_review", "outcome": "definitive_failure", "price_review": review, **outbox_fields("price")},
+        "fulfilling",
+        order["claim_token"],
+    )
+    logging.warning("Order %s waits for a price decision (cost %.2f -> %.2f)", order["id"], old_cost, change.new_cost)
+    if result == SAVED:
+        await flush_one(bot, order["id"])
+        return
+    await alert_admin(
+        bot,
+        f"💱 Order #{order['id']}: the cost rose to {change.new_cost:.2f} (was {old_cost:.2f}) and the "
+        "decision could not be recorded. " + unsaved_note(result),
+        order_id=order["id"],
+    )
+    await notify_delay(bot, order)
+
+
+@dp.callback_query(F.data.startswith("pricego:"))
+async def price_approve(callback: CallbackQuery):
+    """Approve buying at the new (higher) cost."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Not allowed", show_alert=True)
+        return
+    order_id = callback.data.split(":", 1)[1]
+    set_order_id(order_id)
+    try:
+        order = await storage.claim_price_review(order_id)
+    except PyMongoError as exc:
+        log_db_error("claiming a price decision", exc, order=order_id)
+        await callback.answer("Database error - nothing was purchased. Try again.", show_alert=True)
+        return
+    if order is None:
+        await callback.answer("This order is not waiting for a price decision.", show_alert=True)
+        return
+    await process_claimed_order(callback, order)
+
+
+@dp.callback_query(F.data.startswith("pricehold:"))
+async def price_hold(callback: CallbackQuery):
+    """Hold the order instead of buying at the new cost (Retry and Reject then apply)."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Not allowed", show_alert=True)
+        return
+    order_id = callback.data.split(":", 1)[1]
+    set_order_id(order_id)
+    try:
+        order = await storage.hold_price_review(order_id)
+    except PyMongoError as exc:
+        log_db_error("holding a price decision", exc, order=order_id)
+        await callback.answer("Database error - nothing was changed. Try again.", show_alert=True)
+        return
+    if order is None:
+        await callback.answer("This order is not waiting for a price decision.", show_alert=True)
+        return
+    await release_order_stock(order_id)
+    await callback.answer("Held")
+    text = (
+        f"⏸ Order #{order_id} is on hold after the price change. Nothing was bought. "
+        "Tap Retry to look at the price again, or Reject to cancel."
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=admin_keyboard(order_id, retry=True))
+    except Exception:
+        await callback.message.answer(text, reply_markup=admin_keyboard(order_id, retry=True))
+
+
 async def notify_delay(bot: Bot, order: dict) -> None:
     """Best-effort customer notice for the cases where nothing could be recorded."""
     try:
         await bot.send_message(order["user_id"], CUSTOMER_DELAY_NOTICE)
     except Exception:
         logging.exception("Could not notify user %s", order["user_id"])
+
+
+def price_keyboard(order_id: str):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Approve at new cost", callback_data=f"pricego:{order_id}"),
+        InlineKeyboardButton(text="⏸ Hold", callback_data=f"pricehold:{order_id}"),
+    )
+    return builder.as_markup()
+
+
+def price_review_text(order: dict) -> str:
+    review = order["price_review"]
+    price, old_cost, new_cost = float(order["price"]), float(review["old_cost"]), float(review["new_cost"])
+    difference = new_cost - old_cost
+    percent = (difference / old_cost * 100) if old_cost else 0.0
+    margin_old, margin_new = price - old_cost, price - new_cost
+    text = (
+        "💱 PRICE CHANGED - your decision is needed\n"
+        f"Order #{order['id']}\n"
+        f"User: {order['user_label']}\n"
+        f"Product: {order['name']}\n\n"
+        f"Customer paid: {price:.2f} USDT\n"
+        f"Cost when ordered: {old_cost:.2f}\n"
+        f"Cost now ({review['supplier']}): {new_cost:.2f}\n"
+        f"Difference: {difference:+.2f} ({percent:+.1f}%)\n"
+        f"Margin if you buy now: {margin_new:.2f} USDT ({margin_new / price * 100:.1f}% of the price)\n"
+        f"Margin at order time: {margin_old:.2f} USDT ({margin_old / price * 100:.1f}%)\n"
+    )
+    if margin_new < 0:
+        text += f"⚠️ Buying now sells at a LOSS of {-margin_new:.2f} USDT.\n"
+    return text + "\nNothing has been bought. Approve to buy at the new cost, or Hold."
 
 
 def order_alert(order: dict):
@@ -1668,6 +1812,8 @@ def order_alert(order: dict):
         f"Product: {order['name']} ({order['price']:.2f} USDT)\n"
     )
     reason = order.get("error", "-")
+    if kind == "price" and status == "price_review" and "price_review" in order:
+        return price_review_text(order), price_keyboard(order["id"])
     if kind == "held" and status == "held":
         return (
             "🚨 EMERGENCY: order is on hold\n" + head + f"Reason: {reason}\n\n"
