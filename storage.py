@@ -20,7 +20,7 @@ SUPPORTED_LANGS = frozenset({"en", "hi", "es", "zh"})
 DEFAULT_LANG = "en"
 
 # Fields the caller may not overwrite through update_order().
-_PROTECTED_FIELDS = frozenset({"_id", "id", "created_at", "reference_lower"})
+_PROTECTED_FIELDS = frozenset({"_id", "id", "created_at", "reference_lower", "claim_token"})
 
 INTERRUPTED_REASON = (
     "Interrupted: the bot stopped while this order was being fulfilled. "
@@ -251,13 +251,17 @@ class Storage:
         fields: dict,
         *,
         only_if_status: str | Iterable[str] | None = None,
+        claim_token: str | None = None,
     ) -> bool:
         """$set `fields` on an order. Returns True if an order was matched.
 
         With only_if_status (a single status string, or an iterable of them), the
         update applies only while the order's current status is one of those
-        values (a compare-and-set for status changes). Updating `reference`
-        also refreshes reference_lower.
+        values (a compare-and-set for status changes). With claim_token, it also
+        applies only while the order still carries that exact claim token, so a
+        writer from an older attempt can never touch a newer attempt's order. Every
+        write made on behalf of a claimed purchase must pass both. Updating
+        `reference` also refreshes reference_lower.
         """
         if not fields:
             raise ValueError("update_order requires at least one field to set")
@@ -275,6 +279,10 @@ class Storage:
             if not statuses or not all(isinstance(s, str) and s for s in statuses):
                 raise ValueError("only_if_status must be a status string or a non-empty list of them")
             query["status"] = {"$in": statuses}
+        if claim_token is not None:
+            if not isinstance(claim_token, str) or not claim_token:
+                raise ValueError("claim_token must be a non-empty string")
+            query["claim_token"] = claim_token
 
         result = await self._orders.update_one(query, {"$set": update})
         return result.matched_count == 1

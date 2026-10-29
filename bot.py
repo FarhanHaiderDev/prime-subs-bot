@@ -453,17 +453,23 @@ async def _already_applied(order_id: str, fields: dict) -> bool:
     return doc is not None and all(doc.get(key) == value for key, value in fields.items())
 
 
-async def persist_order(order_id: str, fields: dict, expected: str | list[str], attempts: int = 3) -> str:
-    """Write order fields only while the order still has an `expected` status.
+async def persist_order(
+    order_id: str, fields: dict, expected: str | list[str], claim_token: str, attempts: int = 3
+) -> str:
+    """Write order fields only while the order still has an `expected` status AND still
+    carries this attempt's `claim_token`.
 
-    Returns SAVED, STALE (the order is no longer in an expected status, so nothing
-    was written), or FAILED (the database errored on every attempt). Only SAVED
-    means the write took effect.
+    Returns SAVED, STALE (the order is no longer in an expected status or belongs to a
+    newer attempt, so nothing was written), or FAILED (the database errored on every
+    attempt). Only SAVED means the write took effect. The token is mandatory: a late
+    handler from an older attempt must never write onto a newer attempt's order.
     """
     had_error = False
     for attempt in range(attempts):
         try:
-            matched = await storage.update_order(order_id, fields, only_if_status=expected)
+            matched = await storage.update_order(
+                order_id, fields, only_if_status=expected, claim_token=claim_token
+            )
         except PyMongoError as exc:
             had_error = True
             log_db_error("saving order", exc, order=order_id, attempt=attempt + 1)
@@ -475,7 +481,7 @@ async def persist_order(order_id: str, fields: dict, expected: str | list[str], 
         if had_error and await _already_applied(order_id, fields):
             return SAVED
         logging.error(
-            "Order %s not updated: no longer in expected status %s (fields %s)",
+            "Order %s not updated: no longer in expected status %s or claimed by a newer attempt (fields %s)",
             order_id, expected, sorted(fields),
         )
         return STALE
@@ -1251,11 +1257,11 @@ async def approve_order(callback: CallbackQuery):
             "actual_cost": offer.cost,
             "credentials": credentials,  # kept so "My Orders" can show them later
         }
-        result = await persist_order(order_id, delivered_fields, "fulfilling")
+        result = await persist_order(order_id, delivered_fields, "fulfilling", claim_token)
         if result == STALE:
             # Something else moved the order mid-purchase (e.g. a restart recovered it to
             # reconcile). Complete it only from reconcile; never overwrite a newer status.
-            result = await persist_order(order_id, delivered_fields, "reconcile")
+            result = await persist_order(order_id, delivered_fields, "reconcile", claim_token)
         saved = result == SAVED
         stale = result == STALE
         marked = False
@@ -1266,6 +1272,7 @@ async def approve_order(callback: CallbackQuery):
                     order_id,
                     {"status": "reconcile", "outcome": "purchased", "error": PURCHASED_UNRESOLVED},
                     ["fulfilling", "reconcile"],
+                    claim_token,
                 )
                 == SAVED
             )
@@ -1281,7 +1288,7 @@ async def approve_order(callback: CallbackQuery):
 
         status_update_failed = False
         if not delivered and saved:
-            status_update_failed = await persist_order(order_id, {"status": "delivery_failed"}, "delivered") != SAVED
+            status_update_failed = await persist_order(order_id, {"status": "delivery_failed"}, "delivered", claim_token) != SAVED
 
         if not saved or not delivered:
             problems = []
@@ -1345,6 +1352,7 @@ async def approve_order(callback: CallbackQuery):
                     order_id,
                     {"status": "reconcile", "outcome": "purchased", "error": PURCHASED_UNRESOLVED},
                     "fulfilling",
+                    claim_token,
                 )
                 sent = await alert_admin(
                     bot,
@@ -1379,7 +1387,7 @@ async def hold_order(bot: Bot, order: dict, reason: str, *, attempt: int | None 
     fields = {"status": "held", "outcome": "definitive_failure", "error": reason}
     if attempt is not None:
         fields["attempt"] = attempt
-    result = await persist_order(order["id"], fields, "fulfilling")
+    result = await persist_order(order["id"], fields, "fulfilling", order["claim_token"])
     logging.error("Order %s held: %s", order["id"], reason)
 
     summary = (
@@ -1412,6 +1420,7 @@ async def reconcile_order(bot: Bot, order: dict, reason: str) -> None:
             "error": reason,
         },
         "fulfilling",
+        order["claim_token"],
     )
     logging.error("Order %s needs manual reconciliation: %s", order["id"], reason)
 
