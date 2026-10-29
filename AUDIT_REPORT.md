@@ -23,9 +23,32 @@ The sections below describe the tree **as audited** (commit `00371eb`); the file
 
 **New or changed environment variables (names only):** `ENCRYPTION_KEY` (required), `CANBOSO_ENABLED` (optional, keep `false`), and `MONGODB_URI` is required as before. **New order statuses/fields:** status `purchased_undelivered`; fields `credentials_enc`, `purchased_at`, `delivered_at`, `delivery_attempts`, `pay_to`.
 
-**Resolution of the 27 problems in section 9 after Phase 0/1:** 2 resolved (#1, #5), 7 partially resolved (#2, #4, #6, #7, #9, #22, #23), 1 mitigated but still open (#3), 17 open. See the Phase 3 section for the current totals.
+**Resolution of the 27 problems in section 9 after Phase 0/1:** 2 resolved (#1, #5), 7 partially resolved (#2, #4, #6, #7, #9, #22, #23), 1 mitigated but still open (#3), 17 open. See the Phase 3b section for the current totals.
 
 **Known limits of this verification:** the new `ENCRYPTION_KEY`/`MONGODB_URI` values must be added to your real `.env` by you; Pandora and Canboso behaviour is still unverified against the real APIs. (An earlier version of this note said the in-memory MongoDB cannot run the startup-recovery pipeline update. That was wrong: it can, and Phase 3 Item 1 tests recovery on it and on a real server.)
+
+---
+
+## PHASE 3b STATUS UPDATE (branch `fix/phase3b`, built on `fix/phase3`)
+
+Ten items, one commit each, with tests (310 pass, 58 skipped, run offline). The skipped tests are the real-MongoDB runs: most of the new tests run on both the in-memory database and, when `MONGODB_TEST_URI` is set, a real one. No real server was available here, so **none of those real-database runs has been executed yet**; CI runs them and fails if the server is missing. #3 (payment verification) and #9 (refunds) were deliberately not touched.
+
+| Item | Problem | Change |
+|---|---|---|
+| 1 | #26 | `ADMIN_CHAT_ID` must be a positive whole number; a group id, `@username`, `0` or anything else stops startup with a message that says what to fix (the value is not echoed). |
+| 2 | #8 | Admin alerts and customer notices for held, reconciled and recovered orders are recorded on the order in the same write as the state change (`alert_pending`, `notice_pending`), sent immediately, retried with exponential backoff (60 s doubling to 1 h) and re-sent after a restart. They are rebuilt from the current state (an unlock button only for an unknown outcome, never for a purchased order; nothing if the order moved on). Recovered and held orders now notify the customer. |
+| 3 | #10 | A buyer picking a payment method for a product with known stock of 50 or fewer gets a 15-minute reservation of one unit (atomic slot claim, same buyer gets the same unit, cancel releases it); if none is left they get a clear message. The reservation is attached to the order when the proof arrives (a proof after expiry still creates the order, flagged to the admin) and released on rejection, hold, reconciliation and completed purchase. |
+| 4 | #11 | If the live cost is above what the order was priced on, the order is no longer failed: it goes to `price_review` and the admin sees the cost when ordered, the cost now, the difference, the margin if bought now against at order time and a LOSS warning, and chooses Approve at new cost or Hold. `actual_cost` now records what the supplier really charged. |
+| 5 | #20 | `MongoFSMStorage` keeps checkout, search and unlock-flow state in MongoDB (TTL 7 days); verified by resuming each flow through brand-new storage objects. |
+| 6 | #21 | Compound indexes for the status-based scans; the startup reference audit reads only orders that are not finished, through a hinted status-index scan. The whole collection is scanned once, only if the unique index cannot be built because of existing duplicates. |
+| 7 | #16 | Admin `/unblock <payment proof> <reason>` frees the proof of a rejected order; the reason is required and an audit-log entry (admin, time, order, reason, hash of the proof) is written before and completed after the change. |
+| 8 | #17 | `Retry-After` is parsed as seconds or an HTTP date, capped at 30 s, default 5 s. |
+| 9 | #25 | `.vscode` untracked and ignored; `orders.json`/`prefs.json` removed from `.gitignore` (the secret scan still flags them if committed). |
+| 10 | #24, #27 | The Bot session is closed on every exit path; message limits are counted in UTF-16 units. |
+
+**Resolution of the 27 problems in section 9 (current):** 18 resolved (#1, #5, #7, #8, #10, #11, #12, #14, #16, #17, #20, #21, #22, #23, #24, #25, #26, #27), 6 partially resolved (#2, #4, #6, #9, #13, #18), 1 mitigated but still open (#3), 2 open (#15, #19). Each item in section 9 carries its tag.
+
+**Not verified in this session:** the real-MongoDB runs of the tests above (including the concurrent-reservation race and the query-plan check); Docker and the GitHub Actions workflow (as before); behaviour against the live Pandora API. New collections: `reservations`, `fsm`, `audit_log`; new order status: `price_review`; new order fields: `price_review`, `approved_cost`, `alert_*`, `notice_*`, `stock_reservation`, `unblocked_*`.
 
 ---
 
@@ -44,7 +67,7 @@ Eight items, one commit each, with tests (161 pass, 13 skipped, run offline). Th
 | 7 | `scripts/backup_mongo.sh` (timestamped, compressed, owner-only, URI never on the command line) and a backup/restore section in `DEPLOY.md`, stating that `ENCRYPTION_KEY` is not in the backup and must be stored separately. |
 | 8 | `.github/workflows/ci.yml`: tests against a real MongoDB service plus `scripts/secret_scan.py --history` on every push and pull request. |
 
-**Resolution of the 27 problems in section 9 (current):** 7 resolved (#1, #5, #7, #12, #14, #22, #23), 6 partially resolved (#2, #4, #6, #9, #13, #18), 1 mitigated but still open (#3), 13 open (#8, #10, #11, #15, #16, #17, #19, #20, #21, #24, #25, #26, #27). Each item in section 9 carries its tag.
+**Resolution of the 27 problems in section 9 after Phase 3 (superseded by the Phase 3b section):** 7 resolved (#1, #5, #7, #12, #14, #22, #23), 6 partially resolved (#2, #4, #6, #9, #13, #18), 1 mitigated but still open (#3), 13 open (#8, #10, #11, #15, #16, #17, #19, #20, #21, #24, #25, #26, #27). Each item in section 9 carries its tag.
 
 **Not verified in this session:** the Docker image was not built and `docker compose` was not run (no Docker here); the GitHub Actions workflow has not run (it is checked only for structure and YAML validity); `scripts/backup_mongo.sh` was tested against a stub `mongodump`, not the real tool; the contract check was only dry-run and tested with a fake session, never against the live Pandora API.
 
@@ -228,28 +251,28 @@ Eight items, one commit each, with tests (161 pass, 13 skipped, run offline). Th
 
 **MEDIUM**
 7. **[RESOLVED in the repo (Fix 3 encrypts credentials at rest; Phase 3 Item 7 adds scripts/backup_mongo.sh and restore docs). Running it on a schedule, copying backups off-site and backing up ENCRYPTION_KEY separately is up to the operator]** No backup/restore mechanism in the repo; orders and plaintext credentials (1225-1231) live only in MongoDB.
-8. **[OPEN]** Startup-recovery, hold and reconcile alerts are sent once and not retried if Telegram fails (1370-1378, 1382-1415, 1706-1722); recovered orders' customers are not notified.
+8. **[RESOLVED (Phase 3b Item 2: alerts and customer notices are owed on the order, retried with backoff and re-sent after a restart; a customer who cannot be reached is given up on after 8 attempts)]** Startup-recovery, hold and reconcile alerts are sent once and not retried if Telegram fails (1370-1378, 1382-1415, 1706-1722); recovered orders' customers are not notified.
 9. **[PARTIALLY RESOLVED (Fix 3: a paid-but-undelivered order shows Processing and is redelivered automatically; refunds/compensation still NOT PRESENT)]** No refund/compensation path for held, rejected or failed orders (NOT PRESENT); `delivery_failed` shows the paying customer "Failed" (671, 713).
-10. **[OPEN]** Stock race: no reservation; the last unit can be sold twice and the second order is held after payment (204-207, 976, 1003).
-11. **[OPEN]** Price drift between payment and approval makes the cost-ceiling check fail and the order hold (303, 381); there is no repricing.
+10. **[RESOLVED for products with known stock of 50 or fewer (Phase 3b Item 3: 15-minute reservation, clear 'stock gone' message; unknown or plentiful stock is not reserved)]** Stock race: no reservation; the last unit can be sold twice and the second order is held after payment (204-207, 976, 1003).
+11. **[RESOLVED (Phase 3b Item 4: a cost rise parks the order for the admin, with new cost, margin and difference, to Approve at new cost or Hold)]** Price drift between payment and approval makes the cost-ceiling check fail and the order hold (303, 381); there is no repricing.
 12. **[RESOLVED (Phase 3 Item 3: per-user limits on messages, button presses and payment-proof attempts; admin exempt)]** No rate limiting; each tap can trigger supplier catalog fetches (254-261, 976, 1003) and database reads.
 13. **[PARTIALLY RESOLVED (Phase 3 Item 5: scripts/seller_contract_check.py can verify Pandora's shapes and error codes read-only; it has NOT been run against the live API, and Canboso is still unverified)]** Seller behaviour is unverified: Pandora idempotency and error-code classification (342) rely on documentation not in the repo; Canboso response shapes are guessed (137-174).
 14. **[RESOLVED (Phase 3 Item 2: global error handler with traceback logging, a neutral user reply and a short throttled admin alert)]** No global error handler; some user-facing failures are silent (e.g. a `TypeError` from a bad supplier payload escapes `build_catalog`, 234).
 
 **LOW**
 15. **[OPEN]** Duplicate new-order alert possible while the first alert is still in flight (1076 vs 1097; 1614-1643).
-16. **[OPEN (message is clearer; behaviour unchanged)]** A rejected order's reference stays blocked forever (storage.py:424).
-17. **[OPEN]** `Retry-After` parsed with `int()` raises on an HTTP-date header (332) - fails safe to `unknown`.
+16. **[RESOLVED (Phase 3b Item 7: admin /unblock with a required reason and an audit-log entry)]** A rejected order's reference stays blocked forever (storage.py:424).
+17. **[RESOLVED (Phase 3b Item 8: Retry-After is read as seconds or an HTTP date)]** `Retry-After` parsed with `int()` raises on an HTTP-date header (332) - fails safe to `unknown`.
 18. **[PARTIALLY RESOLVED (Phase 3 Item 4: the traceback is still logged, but every log line is now redacted for secrets)]** Language-save failure logs a full traceback (800).
 19. **[OPEN]** Translations cover only the dashboard (576-617).
-20. **[OPEN]** FSM state lost on restart (78).
-21. **[OPEN]** Missing indexes for status-based scans (storage.py:356, 390); startup reference audit scans every order (storage.py:152-183).
+20. **[RESOLVED (Phase 3b Item 5: conversation state is stored in MongoDB)]** FSM state lost on restart (78).
+21. **[RESOLVED (Phase 3b Item 6: status-scan indexes; startup audits only unfinished orders)]** Missing indexes for status-based scans (storage.py:356, 390); startup reference audit scans every order (storage.py:152-183).
 22. **[RESOLVED (every dependency is exact-pinned; the Dockerfile and CI pin Python 3.12)]** No Python version pin; `pymongo` has no exact pin (`requirements.txt`).
 23. **[RESOLVED (47+ offline tests, Dockerfile, docker-compose.yml, DEPLOY.md and a GitHub Actions workflow with tests and a secret scan; the image and the workflow have not been run here)]** Deployment files, CI and tests absent; health server is unauthenticated on `0.0.0.0` (1646-1660).
-24. **[OPEN]** `Bot` session is not closed on `SystemExit` paths (1685-1705) - cosmetic.
-25. **[OPEN (.vscode still tracked; stale JSON lines remain in .gitignore)]** `.vscode/settings.json` is tracked; `.gitignore` still lists `orders.json` / `prefs.json`.
-26. **[OPEN]** Admin id must be a user id, not a group id (552-553).
-27. **[OPEN]** Telegram length limits are approximated in code points (475, 522, 716).
+24. **[RESOLVED (Phase 3b Item 10: the Bot session is closed on every exit path)]** `Bot` session is not closed on `SystemExit` paths (1685-1705) - cosmetic.
+25. **[RESOLVED (Phase 3b Item 9: .vscode untracked and ignored; stale JSON entries removed)]** `.vscode/settings.json` is tracked; `.gitignore` still lists `orders.json` / `prefs.json`.
+26. **[RESOLVED (Phase 3b Item 1: ADMIN_CHAT_ID must be a positive numeric user id, checked at startup)]** Admin id must be a user id, not a group id (552-553).
+27. **[RESOLVED (Phase 3b Item 10: lengths are counted, truncated and split in UTF-16 units)]** Telegram length limits are approximated in code points (475, 522, 716).
 
 ---
 
