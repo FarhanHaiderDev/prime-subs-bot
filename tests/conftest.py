@@ -8,6 +8,7 @@
 
 import os
 import sys
+import uuid
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -62,6 +63,42 @@ async def storage(monkeypatch):
     await s.ensure_indexes()
     monkeypatch.setattr(bot, "storage", s)
     return s
+
+
+def _real_mongo_uri():
+    """MONGODB_TEST_URI points at a THROWAWAY MongoDB used only by the tests. Each test
+    gets its own randomly named database that is dropped afterwards. Atlas hosts are
+    refused unless MONGODB_TEST_ALLOW_REMOTE=1, so production is never touched by accident."""
+    uri = os.environ.get("MONGODB_TEST_URI")
+    if not uri:
+        pytest.skip("MONGODB_TEST_URI is not set; real-MongoDB tests are skipped")
+    if "mongodb.net" in uri and os.environ.get("MONGODB_TEST_ALLOW_REMOTE") != "1":
+        pytest.skip("MONGODB_TEST_URI looks like Atlas; set MONGODB_TEST_ALLOW_REMOTE=1 to allow")
+    return uri
+
+
+@pytest.fixture(params=["mongomock", "real"])
+async def any_storage(request, monkeypatch):
+    """The same test on the in-memory database and (when configured) a real MongoDB."""
+    if request.param == "mongomock":
+        s = Storage("mongodb://unused.invalid", "test_db")
+        s._client = AsyncMongoMockClient()
+        await s.ensure_indexes()
+        monkeypatch.setattr(bot, "storage", s)
+        yield s
+        return
+
+    uri = _real_mongo_uri()
+    db_name = f"psb_test_{uuid.uuid4().hex[:12]}"
+    s = Storage(uri, db_name)
+    await s.connect()
+    await s.ensure_indexes()
+    monkeypatch.setattr(bot, "storage", s)
+    try:
+        yield s
+    finally:
+        await s._client.drop_database(db_name)
+        await s.close()
 
 
 class FakeBot:

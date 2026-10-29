@@ -1,0 +1,19 @@
+# Services for local development and tests. The production bot service is added with the
+# Dockerfile (see DEPLOY.md).
+services:
+  # Throwaway MongoDB for the real-database tests. It exists only under the "test" profile:
+  #   docker compose --profile test up -d mongo-test
+  #   MONGODB_TEST_URI=mongodb://127.0.0.1:27018 pytest
+  #   docker compose --profile test down
+  mongo-test:
+    image: mongo:7
+    profiles: ["test"]
+    ports:
+      - "127.0.0.1:27018:27017" # bound to localhost only, on a non-default port
+    tmpfs:
+      - /data/db # nothing is persisted
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
