@@ -1,0 +1,53 @@
+name: CI
+
+# Runs the tests and a secret scan on every push and pull request.
+on:
+  push:
+  pull_request:
+
+# The workflow only reads the repository; it uses no secrets.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      # A real MongoDB for the recovery/concurrency tests (they also run on an in-memory database).
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval db.adminCommand('ping').ok"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MONGODB_TEST_URI: mongodb://127.0.0.1:27017
+      REQUIRE_REAL_MONGO: "1" # fail, never silently skip, if the real-MongoDB tests cannot run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run the tests
+        run: pytest -q -rs
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the scan reads the full history, not just the latest commit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan the tree and the history for committed secrets
+        run: python scripts/secret_scan.py --history

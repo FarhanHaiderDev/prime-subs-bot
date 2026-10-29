@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "backup_mongo.sh"
 BASH = shutil.which("bash")
-URI = "mongodb+srv://dbuser:Sup3rS3cretPw@cluster0.example.mongodb.net/?retryWrites=true"
+URI = "mongodb+srv://dbuser:Sup3rS3cretPw@cluster0.example.mongodb.net/?retryWrites=true"  # secret-scan: allow (deliberate fake)
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is not available")
 

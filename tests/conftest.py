@@ -71,6 +71,8 @@ def _real_mongo_uri():
     refused unless MONGODB_TEST_ALLOW_REMOTE=1, so production is never touched by accident."""
     uri = os.environ.get("MONGODB_TEST_URI")
     if not uri:
+        if os.environ.get("REQUIRE_REAL_MONGO") == "1":  # set in CI: a missing server must fail, not skip
+            pytest.fail("REQUIRE_REAL_MONGO=1 but MONGODB_TEST_URI is not set")
         pytest.skip("MONGODB_TEST_URI is not set; real-MongoDB tests are skipped")
     if "mongodb.net" in uri and os.environ.get("MONGODB_TEST_ALLOW_REMOTE") != "1":
         pytest.skip("MONGODB_TEST_URI looks like Atlas; set MONGODB_TEST_ALLOW_REMOTE=1 to allow")

@@ -165,9 +165,9 @@ def test_patterns_catch_secrets_that_are_not_in_the_environment():
     redactor = Redactor([])  # nothing configured
     for text in (
         "token 987654321:" + "Q" * 35,
-        "key sk_live_abcdef123456",
+        "key sk_live_abcdef123456",  # secret-scan: allow (deliberate fake)
         "Bearer abcdefgh12345678",
-        "mongodb://user:hunter2@host/db",
+        "mongodb://user:hunter2@host/db",  # secret-scan: allow (deliberate fake)
         "fernet " + Fernet.generate_key().decode(),
     ):
         assert redactor.redact(text) != text
